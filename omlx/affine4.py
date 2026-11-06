@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import struct
+import subprocess
 from functools import cache, lru_cache
 
 import mlx.core as mx
@@ -727,6 +728,307 @@ _MPP_REDUCE_SOURCE = r"""
 """
 
 
+_REG_HEADER = r"""
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+using namespace mpp::tensor_ops;
+"""
+
+
+# Register-resident affine8 flash attention for multi-row (verify) calls. Each
+# simdgroup owns RS (16 or 32) query rows of one KV head and a contiguous token
+# range. Per BK-token step it runs one RS x BK x Dim matmul (half queries in
+# registers, int8 key codes read by the tensor op from device memory) and one
+# RS x Dim x BK matmul (half probabilities in registers, int8 value codes from
+# device memory). Per-token key and value scales fold into the scores and the
+# probabilities, so codes are never dequantized; scores, the online softmax and
+# the output accumulator stay in registers and the token loop has no
+# threadgroup memory traffic or barriers. A threadgroup holds every RS-row
+# chunk of its KV head (simdgroup % Chunks) for Split token ranges, so the
+# chunks of a head stream the same K/V lines through L1 together.
+#
+# Register layout of an RS x C cooperative tensor (destinations and left
+# operands): element i of a lane, with h = i / (C / 2) and e = i % (C / 2), is
+# row fm + 8 * ((e >> 2) & 1) + 16 * h and column 16 * (e >> 3) + fn + (e & 3),
+# where fn = 4 * ((lane & 1) | ((lane >> 2) & 2)) and
+# fm = ((lane >> 2) & 4) | ((lane >> 1) & 3). Lane row r (0 .. RS / 8 - 1) is
+# fm + 8 * (r & 1) + 16 * (r >> 1).
+_REG_ATTENTION_SOURCE = r"""
+    constexpr int TotalRows = Repeats * QueryLength;
+    constexpr int RL = RS / 8;
+    constexpr int SCap = RS * BK / 32;
+    constexpr int OCap = RS * Dim / 32;
+    constexpr int SHalf = BK / 2;
+    constexpr int OHalf = Dim / 2;
+    constexpr float kLog2e = 1.4426950408889634f;
+    constexpr float kMaskedMax = -1.0e30f;
+    ushort lane = thread_index_in_simdgroup;
+    int sg = int(simdgroup_index_in_threadgroup);
+    uint3 group = threadgroup_position_in_grid;
+    // GroupChunks: the chunks of a KV head share a threadgroup; otherwise
+    // every chunk is its own one-simdgroup threadgroup.
+    int chunk = GroupChunks ? sg % Chunks : int(group.x) % Chunks;
+    int split = GroupChunks ? sg / Chunks : sg;
+    int kv_head = GroupChunks ? int(group.x) : int(group.x) / Chunks;
+    int batch = int(group.y);
+    int blocks = int(params[1]);
+    int block = int(group.z) * Split + split;
+    int tokens = int(params[0]);
+    float attention_scale = as_type<float>(params[2]);
+    bool causal = bool(params[3]);
+    int valid_start = int(valid_starts[batch]);
+    int valid_end = int(valid_ends[batch]);
+    int fn = 4 * (int(lane & 1) | int((lane >> 2) & 2));
+    int fm = int((lane >> 2) & 4) | int((lane >> 1) & 3);
+    int head_rows = Chunks * RS;
+    int row_offset = (batch * NumKvHeads + kv_head) * head_rows + chunk * RS;
+
+    int first_step = max(0, valid_start) / BK;
+    int last_step = (min(tokens, valid_end) + BK - 1) / BK;
+    int nsteps = max(0, last_step - first_step);
+    int per_block = (nsteps + blocks - 1) / blocks;
+    int step_begin = first_step + block * per_block;
+    int step_end = min(last_step, step_begin + per_block);
+
+    if (step_begin >= step_end) {
+        if (fn == 0) {
+            for (short r = 0; r < RL; ++r) {
+                int idx = (row_offset + fm + 8 * (r & 1) + 16 * (r >> 1)) * blocks + block;
+                sums[idx] = 0.0f;
+                maxs[idx] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    const device uint* key_words = keys + batch * keys_strides[0] + kv_head * keys_strides[1];
+    const device uint* value_words = values + batch * values_strides[0] + kv_head * values_strides[1];
+    using CodeTensor = tensor<device int8_t, dextents<int, 2>, tensor_inline>;
+    CodeTensor k_t((device int8_t*)key_words, dextents<int, 2>{Dim, tokens},
+        array<int, 2>{1, int(keys_strides[2]) * 4});
+    CodeTensor v_t((device int8_t*)value_words, dextents<int, 2>{Dim, tokens},
+        array<int, 2>{1, int(values_strides[2]) * 4});
+    auto k_first = k_t.template slice<Dim, BK>(0, 0);
+    auto v_first = v_t.template slice<Dim, BK>(0, 0);
+
+    constexpr auto qk_desc = matmul2d_descriptor(
+        RS, BK, Dim, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+    constexpr auto av_desc = matmul2d_descriptor(
+        RS, Dim, BK, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<qk_desc, execution_simdgroup> qk_op;
+    matmul2d<av_desc, execution_simdgroup> av_op;
+    auto q = qk_op.template get_left_input_cooperative_tensor<half, int8_t, float>();
+    auto s = qk_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(q)>, decltype(k_first), float>();
+    auto p = av_op.template get_left_input_cooperative_tensor<half, int8_t, float>();
+    auto o = av_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(p)>, decltype(v_first), float>();
+
+    // Query rows of this lane, scaled into half range.
+    float row_mul[RL];
+    int row_position[RL];
+    int row_mask_head[RL];
+    {
+        float amax[RL];
+        float inv[RL];
+        const device float* qrow[RL];
+        bool active[RL];
+        for (short r = 0; r < RL; ++r) {
+            int global_row = chunk * RS + fm + 8 * (r & 1) + 16 * (r >> 1);
+            active[r] = global_row < TotalRows;
+            int head_in_kv = active[r] ? global_row / QueryLength : 0;
+            int position = active[r] ? global_row % QueryLength : 0;
+            row_position[r] = position;
+            row_mask_head[r] = head_in_kv;
+            qrow[r] = (const device float*)queries + batch * queries_strides[0] +
+                (kv_head * Repeats + head_in_kv) * queries_strides[1] +
+                position * queries_strides[2];
+            amax[r] = 0.0f;
+            for (int d = 0; d < Dim; d += 16)
+                for (short j = 0; j < 4; ++j)
+                    amax[r] = max(amax[r], active[r] ? abs(qrow[r][d + fn + j]) : 0.0f);
+            amax[r] = max(amax[r], simd_shuffle_xor(amax[r], ushort(1)));
+            amax[r] = max(amax[r], simd_shuffle_xor(amax[r], ushort(8)));
+            float qscale = max(1.0f, amax[r] / 60000.0f);
+            inv[r] = 1.0f / qscale;
+            row_mul[r] = qscale * attention_scale * kLog2e;
+        }
+        #pragma unroll
+        for (short i = 0; i < OCap; ++i) {
+            short e = i % OHalf;
+            short r = ((e >> 2) & 1) + 2 * (i / OHalf);
+            int d = 16 * (e >> 3) + fn + (e & 3);
+            q[i] = half(active[r] ? qrow[r][d] * inv[r] : 0.0f);
+        }
+    }
+
+    const device auto* kscale = key_scales + batch * key_scales_strides[0] +
+        kv_head * key_scales_strides[1];
+    const device auto* vscale = value_scales + batch * value_scales_strides[0] +
+        kv_head * value_scales_strides[1];
+    int kscale_stride = int(key_scales_strides[2]);
+    int vscale_stride = int(value_scales_strides[2]);
+    const device bool* mask_row[RL];
+    for (short r = 0; r < RL; ++r)
+        mask_row[r] = mask + batch * mask_strides[0] +
+            (kv_head * Repeats + row_mask_head[r]) * mask_strides[1] +
+            row_position[r] * mask_strides[2];
+    int mask_token_stride = int(mask_strides[3]);
+    int last_token = tokens - 1;
+    int row_end[RL];
+    int interior_end = tokens;
+    for (short r = 0; r < RL; ++r) {
+        row_end[r] = causal ? valid_end - QueryLength + row_position[r] + 1 : valid_end;
+        interior_end = min(interior_end, row_end[r]);
+    }
+
+    #pragma unroll
+    for (short i = 0; i < OCap; ++i)
+        o[i] = 0.0f;
+    float m[RL], l[RL];
+    for (short r = 0; r < RL; ++r) {
+        m[r] = kMaskedMax;
+        l[r] = 0.0f;
+    }
+
+    for (int step = step_begin; step < step_end; ++step) {
+        int t0 = step * BK;
+        // Explicit mask bits of this lane's score elements, read before the
+        // matmul (bit i = element i).
+        uint mask_bits = ~0u;
+        if (HasMask) {
+            mask_bits = 0u;
+            #pragma unroll
+            for (short i = 0; i < SCap; ++i) {
+                short e = i % SHalf;
+                short r = ((e >> 2) & 1) + 2 * (i / SHalf);
+                int t = min(t0 + 16 * (e >> 3) + fn + (e & 3), last_token);
+                mask_bits |= uint(mask_row[r][t * mask_token_stride]) << i;
+            }
+        }
+        #pragma unroll
+        for (short i = 0; i < SCap; ++i)
+            s[i] = 0.0f;
+        auto k_slice = k_t.template slice<Dim, BK>(0, t0);
+        qk_op.run(q, k_slice, s);
+
+        // Columns of this lane: 16 * (c >> 2) + fn + (c & 3).
+        float ks[BK / 4], vs[BK / 4];
+        #pragma unroll
+        for (short c = 0; c < BK / 4; ++c) {
+            int t = min(t0 + 16 * (c >> 2) + fn + (c & 3), last_token);
+            ks[c] = float(kscale[t * kscale_stride]);
+            vs[c] = float(vscale[t * vscale_stride]);
+        }
+        bool interior = !HasMask && t0 >= valid_start && t0 + BK <= interior_end;
+        float tile_max[RL];
+        for (short r = 0; r < RL; ++r)
+            tile_max[r] = m[r];
+        #pragma unroll
+        for (short i = 0; i < SCap; ++i) {
+            short e = i % SHalf;
+            short r = ((e >> 2) & 1) + 2 * (i / SHalf);
+            short c = (e & 3) + ((e >> 3) << 2);
+            float v = s[i] * (row_mul[r] * ks[c]);
+            if (!interior) {
+                int t = t0 + 16 * (e >> 3) + fn + (e & 3);
+                bool ok = t >= valid_start && t < row_end[r] && t < tokens &&
+                    ((mask_bits >> i) & 1u);
+                v = ok ? v : kMaskedMax * 2.0f;
+            }
+            s[i] = v;
+            tile_max[r] = max(tile_max[r], v);
+        }
+        float factor[RL], part[RL];
+        for (short r = 0; r < RL; ++r) {
+            tile_max[r] = max(tile_max[r], simd_shuffle_xor(tile_max[r], ushort(1)));
+            tile_max[r] = max(tile_max[r], simd_shuffle_xor(tile_max[r], ushort(8)));
+            part[r] = 0.0f;
+        }
+        #pragma unroll
+        for (short i = 0; i < SCap; ++i) {
+            short e = i % SHalf;
+            short r = ((e >> 2) & 1) + 2 * (i / SHalf);
+            short c = (e & 3) + ((e >> 3) << 2);
+            // Masked columns may be padding with arbitrary scales: zero them
+            // explicitly instead of multiplying a zero weight by the scale.
+            bool live = s[i] > kMaskedMax;
+            float w = live ? fast::exp2(s[i] - tile_max[r]) : 0.0f;
+            part[r] += w;
+            p[i] = live ? half(w * vs[c]) : half(0.0f);
+        }
+        for (short r = 0; r < RL; ++r) {
+            part[r] += simd_shuffle_xor(part[r], ushort(1));
+            part[r] += simd_shuffle_xor(part[r], ushort(8));
+            factor[r] = fast::exp2(m[r] - tile_max[r]);
+            l[r] = l[r] * factor[r] + part[r];
+            m[r] = tile_max[r];
+        }
+        #pragma unroll
+        for (short i = 0; i < OCap; ++i)
+            o[i] *= factor[(((i % OHalf) >> 2) & 1) + 2 * (i / OHalf)];
+        auto v_slice = v_t.template slice<Dim, BK>(0, t0);
+        av_op.run(p, v_slice, o);
+    }
+
+    #pragma unroll
+    for (short r = 0; r < RL; ++r) {
+        int idx = (row_offset + fm + 8 * (r & 1) + 16 * (r >> 1)) * blocks + block;
+        bool has = l[r] > 0.0f;
+        if (fn == 0) {
+            sums[idx] = l[r];
+            maxs[idx] = has ? m[r] * 0.6931471805599453f : 0.0f;
+        }
+        if (has) {
+            device float* out = partials + size_t(idx) * Dim + fn;
+            int base = (r >> 1) * OHalf + (r & 1) * 4;
+            #pragma unroll
+            for (short f = 0; f < Dim / 16; ++f)
+                *(device float4*)(out + 16 * f) = float4(
+                    o[base + f * 8 + 0], o[base + f * 8 + 1],
+                    o[base + f * 8 + 2], o[base + f * 8 + 3]);
+        }
+    }
+"""
+
+
+@cache
+def _reg_attention_kernel(
+    dim: int,
+    repeats: int,
+    query_length: int,
+    chunks: int,
+    split: int,
+    kv_heads: int,
+    block_tokens: int,
+    chunk_rows: int,
+    group_chunks: bool,
+):
+    return mx.fast.metal_kernel(
+        name=(
+            f"affine8_reg_d{dim}_r{repeats}_l{query_length}_"
+            f"c{chunks}x{chunk_rows}{'g' if group_chunks else 'u'}_s{split}_"
+            f"h{kv_heads}_k{block_tokens}"
+        ),
+        input_names=[
+            "queries",
+            "keys",
+            "key_scales",
+            "values",
+            "value_scales",
+            "valid_starts",
+            "valid_ends",
+            "mask",
+            "params",
+        ],
+        output_names=["partials", "sums", "maxs"],
+        header=_REG_HEADER,
+        source=_REG_ATTENTION_SOURCE,
+        ensure_row_contiguous=False,
+        compile_options={"math_mode": "fast"},
+    )
+
+
 @cache
 def _mpp_attention_kernel(
     dim: int,
@@ -848,6 +1150,216 @@ def _attention_warps(dim: int) -> int:
     return 4
 
 
+# The register kernel replaces the threadgroup kernel (affine8, dim <= 128)
+# above _REG_MIN_ROWS query rows per KV head, and for fewer rows from
+# _REG_MIN_TOKENS_SMALL cached tokens.
+_REG_MIN_ROWS = 8
+_REG_MIN_TOKENS_SMALL = 96 * 1024
+# A GPU core keeps 16 of the kernel's simdgroups resident, as whole
+# threadgroups of Chunks simdgroups. Token ranges are sized so the grid is one
+# full wave: a threadgroup past it waits for a whole range and roughly doubles
+# the time. Ranges stay at least 8 steps so short caches do not pay for
+# partials they do not need.
+_REG_SIMDGROUPS_PER_CORE = 16
+_REG_MIN_BLOCK_STEPS = 8
+_REG_BLOCK_TOKENS = 32
+_REG_SPLIT = 0
+_REG_BLOCKS = 0
+_REG_ROWS = 0
+_REG_GROUP_CHUNKS = True
+
+
+@lru_cache(maxsize=1)
+def _gpu_cores() -> int:
+    try:
+        listing = subprocess.run(
+            ["/usr/sbin/ioreg", "-r", "-c", "AGXAccelerator", "-d", "1"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+        for line in listing.splitlines():
+            if '"gpu-core-count"' in line:
+                return max(1, int(line.rsplit("=", 1)[1]))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return 20
+
+
+def _register_blocks(batch: int, kv_heads: int, chunks: int, split: int, steps: int) -> int:
+    if _REG_GROUP_CHUNKS:
+        size = chunks * split
+        per_core = _REG_SIMDGROUPS_PER_CORE // size
+        # Sizes that do not divide the core's slots (3 chunks) keep one
+        # threadgroup slot free: filling it measured as a second wave.
+        if _REG_SIMDGROUPS_PER_CORE % size:
+            per_core -= 1
+        groups = _gpu_cores() * max(1, per_core) // (batch * kv_heads)
+    else:
+        groups = _gpu_cores() * _REG_SIMDGROUPS_PER_CORE // (
+            batch * kv_heads * chunks * split
+        )
+    blocks = max(1, groups) * split
+    return max(split, min(blocks, max(1, steps // _REG_MIN_BLOCK_STEPS) // split * split))
+
+
+def _use_register_kernel(bits: int, dim: int, total_rows: int, tokens: int) -> bool:
+    # One 8-row tile (single-token decode) pads to 16 rows here; it gains only
+    # once the cache is long enough to be bandwidth-bound. Dim 64 is left out:
+    # with an explicit mask its build returned wrong rows nondeterministically
+    # on macOS 27 / M5 Pro (dims 32, 96 and 128 were exact over repeats).
+    return (
+        bits == 8
+        and dim % 32 == 0
+        and dim <= 128
+        and dim != 64
+        and (total_rows > _REG_MIN_ROWS or tokens >= _REG_MIN_TOKENS_SMALL)
+    )
+
+
+def _register_attention(
+    cache,
+    queries,
+    keys_state,
+    values_state,
+    scale,
+    mask,
+    sinks,
+    causal,
+    has_mask,
+    valid_starts,
+    valid_ends,
+    tokens,
+    kv_heads,
+    repeats,
+):
+    batch, query_heads, query_length, dim = queries.shape
+    total_rows = repeats * query_length
+    chunk_rows = _REG_ROWS or 16
+    chunks = (total_rows + chunk_rows - 1) // chunk_rows
+    split = _REG_SPLIT or 1
+    head_rows = chunks * chunk_rows
+    steps = (tokens + _REG_BLOCK_TOKENS - 1) // _REG_BLOCK_TOKENS
+    blocks = _REG_BLOCKS or _register_blocks(batch, kv_heads, chunks, split, steps)
+    signature = (
+        "reg",
+        dim,
+        repeats,
+        query_length,
+        chunks,
+        split,
+        kv_heads,
+        keys_state.norms.dtype,
+        has_mask,
+        sinks is not None,
+        _REG_BLOCK_TOKENS,
+        chunk_rows,
+        _REG_GROUP_CHUNKS,
+    )
+    if _NATIVE_LAUNCHABLE.get(signature) is False:
+        return None
+    params = mx.array(
+        [tokens, blocks, _float_bits(float(scale)), int(causal)], dtype=mx.uint32
+    )
+    grouped = queries.reshape(batch, kv_heads, repeats, query_length, dim)
+    rotated = cache.key_codec.prepare_queries(grouped)
+    rows = batch * kv_heads * head_rows
+    has_sinks = sinks is not None
+    if has_sinks:
+        row_sinks = mx.broadcast_to(
+            sinks.astype(mx.float32).reshape(1, kv_heads, repeats, 1),
+            (batch, kv_heads, repeats, query_length),
+        ).reshape(batch, kv_heads, total_rows)
+        if head_rows > total_rows:
+            row_sinks = mx.concatenate(
+                [
+                    row_sinks,
+                    mx.zeros(
+                        (batch, kv_heads, head_rows - total_rows), dtype=mx.float32
+                    ),
+                ],
+                axis=-1,
+            )
+        row_sinks = mx.contiguous(row_sinks).reshape(-1)
+    else:
+        row_sinks = mx.zeros((1,), dtype=mx.float32)
+    try:
+        kernel = _reg_attention_kernel(
+            dim, repeats, query_length, chunks, split, kv_heads, _REG_BLOCK_TOKENS,
+            chunk_rows, bool(_REG_GROUP_CHUNKS),
+        )
+        group_chunks = 1 if _REG_GROUP_CHUNKS else chunks
+        tg_simdgroups = split * (chunks if _REG_GROUP_CHUNKS else 1)
+        partials, sums, maxs = kernel(
+            inputs=[
+                rotated.reshape(batch, query_heads, query_length, dim).astype(mx.float32),
+                keys_state.indices,
+                keys_state.norms,
+                values_state.indices,
+                values_state.norms,
+                valid_starts,
+                valid_ends,
+                mx.broadcast_to(mask, (batch, query_heads, query_length, tokens)),
+                params,
+            ],
+            template=[
+                ("Dim", dim),
+                ("Repeats", repeats),
+                ("QueryLength", query_length),
+                ("Chunks", chunks),
+                ("Split", split),
+                ("NumKvHeads", kv_heads),
+                ("BK", _REG_BLOCK_TOKENS),
+                ("RS", chunk_rows),
+                ("GroupChunks", bool(_REG_GROUP_CHUNKS)),
+                ("HasMask", has_mask),
+            ],
+            output_shapes=[(rows, blocks, dim), (rows, blocks), (rows, blocks)],
+            output_dtypes=[mx.float32, mx.float32, mx.float32],
+            grid=(kv_heads * group_chunks * 32, batch * tg_simdgroups, blocks // split),
+            threadgroup=(32, tg_simdgroups, 1),
+        )
+        rotated_output = _mpp_reduce_kernel(dim)(
+            inputs=[partials, sums, maxs, row_sinks, params],
+            template=[("Dim", dim), ("HasSinks", has_sinks)],
+            output_shapes=[(batch, kv_heads, head_rows, dim)],
+            output_dtypes=[mx.float32],
+            grid=(rows * dim, 1, 1),
+            threadgroup=(dim, 1, 1),
+        )[0]
+        if head_rows > total_rows:
+            rotated_output = rotated_output[:, :, :total_rows]
+        rotated_output = rotated_output.reshape(
+            batch, kv_heads, repeats, query_length, dim
+        )
+        output = cache.value_codec._rotate_inverse(rotated_output)
+        output = output.reshape(batch, query_heads, query_length, dim).astype(
+            queries.dtype
+        )
+        if signature not in _NATIVE_LAUNCHABLE:
+            mx.eval(output)
+            _NATIVE_LAUNCHABLE[signature] = True
+            logger.info(
+                "Affine8 register attention active (d=%d, rows=%d, chunks=%d)",
+                dim,
+                total_rows,
+                chunks,
+            )
+        return output
+    except (RuntimeError, ValueError) as error:
+        if is_command_buffer_error(error):
+            raise
+        _NATIVE_LAUNCHABLE[signature] = False
+        logger.warning(
+            "Affine8 register attention unavailable for d=%d rows=%d; "
+            "using the threadgroup kernel",
+            dim,
+            total_rows,
+        )
+        logger.debug("Register kernel launch failure", exc_info=True)
+        return None
+
+
 def _native_attention(
     cache,
     queries: mx.array,
@@ -940,6 +1452,26 @@ def _native_attention(
         valid_ends = mx.array([min(int(e), tokens) for e in row_ends], dtype=mx.int32)
     else:
         valid_ends = mx.full((batch,), tokens, dtype=mx.int32)
+
+    if _use_register_kernel(cache.key_codec.bits, dim, total_rows, tokens):
+        output = _register_attention(
+            cache,
+            queries,
+            keys_state,
+            values_state,
+            scale,
+            mask,
+            sinks,
+            causal,
+            has_mask,
+            valid_starts,
+            valid_ends,
+            tokens,
+            kv_heads,
+            repeats,
+        )
+        if output is not None:
+            return output
 
     blocks = _attention_blocks(tokens, kv_heads, dim, cache.key_codec.bits)
     partition_tiles = ((tokens + 63) // 64 + blocks - 1) // blocks

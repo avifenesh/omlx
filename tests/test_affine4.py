@@ -199,6 +199,17 @@ def test_portable_attention_masks_sinks_and_dimensions(
         (2, 2, 3, 7, 64, 700, mx.float16, Affine4KVCache, True),
         (1, 4, 8, 6, 128, 2049, mx.bfloat16, Affine8KVCache, True),
         (2, 4, 8, 8, 128, 1025, mx.float16, Affine4KVCache, True),
+        # Affine8 register kernel: 16-row chunks of 1-4 per KV head,
+        # token counts off the 32-token step, batches and every dim it takes.
+        (1, 4, 8, 2, 128, 3001, mx.bfloat16, Affine8KVCache, True),
+        (1, 4, 8, 6, 128, 4099, mx.bfloat16, Affine8KVCache, True),
+        (1, 4, 8, 8, 128, 2017, mx.bfloat16, Affine8KVCache, True),
+        (2, 4, 8, 4, 128, 1500, mx.float16, Affine8KVCache, True),
+        (2, 2, 6, 3, 96, 999, mx.float16, Affine8KVCache, False),
+        (1, 2, 4, 5, 128, 777, mx.bfloat16, Affine8KVCache, True),
+        (1, 3, 2, 9, 32, 600, mx.float16, Affine8KVCache, False),
+        # One 8-row tile takes the register kernel from 96K tokens.
+        (1, 4, 8, 1, 128, 98500, mx.bfloat16, Affine8KVCache, True),
     ],
 )
 def test_actual_native_matches_portable(
@@ -228,6 +239,31 @@ def test_actual_native_matches_portable(
     monkeypatch.setattr(affine4, "_tensor_ops_available", lambda: False)
     portable = cache.attention(q, scale=dim**-0.5, mask=mask, sinks=sinks)
     close(native, portable, atol=6e-3 if dtype == mx.bfloat16 else 2e-3)
+
+
+@pytest.mark.parametrize(
+    "rows,tokens,bits,expected",
+    [(2, 1025, 8, True), (5, 1025, 8, True), (1, 1025, 8, False), (2, 1025, 4, False)],
+)
+def test_register_kernel_takes_multi_row_affine8(monkeypatch, rows, tokens, bits, expected):
+    """Verify rows (more than one 8-row tile) of affine8 use the register kernel."""
+    require_tensor_ops()
+    cache = (Affine8KVCache if bits == 8 else Affine4KVCache)()
+    cache.update_and_fetch(random((1, 4, tokens, 128)), random((1, 4, tokens, 128), seed=1))
+    q = random((1, 32, rows, 128), seed=2)
+    launched = []
+    real = affine4._reg_attention_kernel
+
+    def counting(*args):
+        launched.append(args)
+        return real(*args)
+
+    monkeypatch.setattr(affine4, "_reg_attention_kernel", counting)
+    mask = "causal" if rows > 1 else None
+    out = affine4._native_attention(cache, q, *cache.state, 128**-0.5, mask, None)
+    assert out is not None
+    assert bool(launched) == expected
+    close(out, dense(cache, q, mask), atol=3e-3)
 
 
 @pytest.mark.parametrize(
