@@ -682,3 +682,18 @@ def test_batch_left_padding_is_read_from_the_device_once_per_assignment(monkeypa
     mask = cache._attention_mask(None, 1, 16)
     assert len(reads) == 2
     assert mask[:, 0, 0, :].tolist() == [[False] * 3 + [True] * 13, [True] * 16]
+
+
+def test_attention_blocks_wide_dim_split():
+    """Head dims of 256 split long caches wider: affine8 from 48K tokens,
+    affine4 from 128K."""
+    blocks = affine4._attention_blocks
+    # dim 128 keeps the stock 168-group target.
+    assert blocks(245_000, 4, 128, 8) == 42
+    assert blocks(245_000, 4, 256, 8) == 168
+    assert blocks(245_000, 4, 256, 4) == 84
+    assert blocks(64_000, 4, 256, 4) == 42
+    assert blocks(64_000, 4, 256, 8) == 168
+    assert blocks(32_000, 4, 256, 8) == 42
+    # Never more blocks than 64-token tiles.
+    assert blocks(1_000, 4, 256, 8) == (1_000 + 63) // 64
