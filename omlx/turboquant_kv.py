@@ -273,6 +273,37 @@ def _spare_capacity(tokens: int) -> int:
     return (tokens // step + 2) * step
 
 
+def _copy_state(state):
+    """Copy every array of a packed state into a buffer of its own.
+
+    ``mx.contiguous`` copies a view that starts inside a larger buffer. A zero
+    buffer fully overwritten by slice assignment would not: MLX hands back
+    the source's buffer for a write that covers the whole array.
+    """
+    if isinstance(state, mx.array):
+        return mx.contiguous(state)
+    fields = [_copy_state(field) for field in state]
+    return type(state)(*fields) if hasattr(state, "_fields") else tuple(fields)
+
+
+def _row_run(batch_indices) -> tuple[int, int] | None:
+    """``(start, stop)`` when ``batch_indices`` is one ascending run of rows."""
+    if isinstance(batch_indices, mx.array):
+        if batch_indices.ndim != 1:
+            return None
+        batch_indices = batch_indices.tolist()
+    if isinstance(batch_indices, slice) or not batch_indices:
+        return None
+    try:
+        rows = [int(i) for i in batch_indices]
+    except (TypeError, ValueError):
+        return None
+    start = rows[0]
+    if start < 0 or rows != list(range(start, start + len(rows))):
+        return None
+    return start, start + len(rows)
+
+
 def _state_rows(state) -> int:
     """Batch rows of a packed state."""
     first = state[0]
@@ -546,6 +577,8 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
     # ---- update_and_fetch override for B>1 only ----------------------------
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
+        if getattr(self, "_rows_view", False):
+            self._compact_rows()
         if isinstance(self.offset, int):
             # B=1: parent's method directly (zero overhead)
             return super().update_and_fetch(keys, values)
@@ -686,8 +719,17 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         if self._row_ends is not None:
             ends = mx.array(self._row_ends)[batch_indices].reshape(-1).tolist()
         if self.keys is not None:
-            self.keys = _filter_state(self.keys, batch_indices)
-            self.values = _filter_state(self.values, batch_indices)
+            # Rows that stay as one ascending run are kept as a view of the
+            # batch buffer for now. A gather copies them right away, while a
+            # finished row's cache, handed to the prefix store, still points
+            # into the old buffer: a row leaving a 2-row batch needed one more
+            # row of KV for a moment. The view is copied layer by layer at the
+            # next append (_compact_rows), once the store payload has let go.
+            rows = _row_run(batch_indices)
+            index = batch_indices if rows is None else slice(*rows)
+            self.keys = _filter_state(self.keys, index)
+            self.values = _filter_state(self.values, index)
+            self._rows_view = rows is not None
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
         # Shift left to drop shared padding, mirroring BatchKVCache.filter().
@@ -712,6 +754,27 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
             self._set_ends([end - min_left_pad for end in ends])
         self._cached_state = None
         self._cached_state_offset = -1
+
+    def _compact_rows(self) -> None:
+        """Copy the rows kept as a view by ``filter`` into a buffer of their own.
+
+        A view of a larger buffer cannot be written in place, so the next
+        token would copy it anyway. Copying here, one layer per call and
+        evaluated at once, lets the old buffer go before the next layer copies
+        its own, and the pool is cleared under the same size gate as a
+        restore's.
+        """
+        self._rows_view = False
+        if self.keys is None:
+            return
+        self.keys = _copy_state(self.keys)
+        self.values = _copy_state(self.values)
+        mx.eval(self.keys, self.values)
+        self._cached_state = None
+        self._cached_state_offset = -1
+        from .cache.prefix_cache import _RESTORE_POOL_FLUSH_BYTES, BlockAwarePrefixCache
+
+        BlockAwarePrefixCache._flush_restore_pool_if_over(_RESTORE_POOL_FLUSH_BYTES)
 
     def extend(self, other: "BatchTurboQuantKVCache"):
         if not isinstance(other, BatchTurboQuantKVCache):
@@ -776,6 +839,7 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         self.offset = mx.concatenate([s_off, o_off])
         self.left_padding = mx.concatenate([s_lp, o_lp])
         self._phys_end = max_idx
+        self._rows_view = False
         self._cached_state = None
         self._cached_state_offset = -1
 
