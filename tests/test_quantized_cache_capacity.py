@@ -183,3 +183,74 @@ def test_merge_keeps_an_empty_request_as_a_zero_row(empty_first):
     assert batch.keys.norms.shape[0] == 2
     assert _equal(_row(_written(batch), row, 0, 40), expected)
     assert not mx.any(batch.keys.norms[1 - row]).item()
+
+
+@pytest.mark.parametrize("stays", [0, 1])
+def test_a_row_leaving_is_copied_out_layer_by_layer(monkeypatch, stays):
+    """The rows that stay are copied at the next token one layer at a time.
+
+    Each layer's old buffer goes before the next layer copies, so the peak
+    does not hold the old batch on top of the rows that stay, and each copy
+    asks for the restore's gated pool clear. The pool size itself depends on
+    allocator timing, so only the request is checked, not the bytes left.
+    """
+    import omlx.cache.prefix_cache as prefix_cache
+
+    flushes = []
+    monkeypatch.setattr(
+        prefix_cache.BlockAwarePrefixCache,
+        "_flush_restore_pool_if_over",
+        staticmethod(lambda flush_bytes: flushes.append(flush_bytes) or False),
+    )
+    layers, tokens = 8, 4096
+    batches = [
+        BatchAffine8KVCache.merge(
+            [_cache(tokens, seed=40 + i), _cache(tokens, seed=60 + i)]
+        )
+        for i in range(layers)
+    ]
+    expected = [
+        [mx.contiguous(part) for part in _row(_written(batch), stays, 0, tokens)]
+        for batch in batches
+    ]
+    mx.eval(expected)
+    kept = sum(part.nbytes for parts in expected for part in parts)
+    mx.synchronize()
+    mx.clear_cache()
+    before = mx.get_active_memory()
+    mx.reset_peak_memory()
+
+    for batch in batches:
+        batch.filter([stays])
+    # One decode step: every layer appends, evaluated together at the end.
+    new = mx.random.normal((1, HEADS, 1, DIM)).astype(mx.float16)
+    for batch in batches:
+        batch.update_and_fetch(new, new)
+    mx.eval([part for batch in batches for part in _written(batch)])
+
+    extra = mx.get_peak_memory() - before
+    assert extra < 0.5 * kept, f"leave peaked {extra / kept:.2f} x the kept rows"
+    # The leaving row's half of the old buffer is no longer live.
+    assert mx.get_active_memory() - before < -0.8 * kept
+    assert flushes == [prefix_cache._RESTORE_POOL_FLUSH_BYTES] * layers
+    for batch, parts in zip(batches, expected):
+        assert batch.left_padding.tolist() == [0]
+        assert _equal(_row(_written(batch), 0, 0, tokens), parts)
+
+
+def test_filter_of_scattered_rows_still_gathers_them():
+    rows = [_cache(200 + 50 * i, seed=80 + i) for i in range(3)]
+    batch = BatchAffine8KVCache.merge(rows)
+    expected = [_row(_written(batch), r, 100 - 50 * r, 300) for r in (0, 2)]
+    expected = [[mx.contiguous(part) for part in parts] for parts in expected]
+    mx.eval(expected)
+
+    batch.filter([0, 2])
+    mx.eval(batch.keys, batch.values)
+
+    assert batch.offset.tolist() == [200, 300]
+    assert batch.left_padding.tolist() == [100, 0]
+    assert _equal(_row(_written(batch), 0, 100, 300), expected[0])
+    assert _equal(_row(_written(batch), 1, 0, 300), expected[1])
+    _append(batch)
+    assert _equal(_row(_written(batch), 1, 0, 300), expected[1])
