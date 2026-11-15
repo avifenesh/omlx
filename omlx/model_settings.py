@@ -373,6 +373,9 @@ class ModelSettings:
         dflash_draft_window_size: Context tokens the drafter attends to
             (None = the draft checkpoint's sliding_window, else 2048).
         dflash_block_size: Draft/verify tokens per cycle (None = checkpoint default).
+        dflash_context_copy: Let a copy of a repeated stretch of the context
+            replace the drafted block when it fills it (prompt lookup, as
+            Lightning MTP does); the target still verifies every token.
         dflash_verify_mode: "adaptive", "dflash" or "off" (None = "adaptive").
             "adaptive" verifies the number of drafts per cycle that the
             Lightning MTP depth controllers pick from measured cost and
@@ -532,6 +535,7 @@ class ModelSettings:
     dflash_draft_window_size: Optional[int] = None
     dflash_block_size: Optional[int] = None
     dflash_verify_mode: Optional[str] = None  # "adaptive" | "dflash" | "off"
+    dflash_context_copy: bool = False
 
     # Lightning MTP uses the embedded head for single and concurrent requests.
     # Equal-depth rows share target verification when supported by the backbone;
