@@ -1476,6 +1476,7 @@ class EnginePool:
             add("dflash_draft_window_size", data.get("dflash_draft_window_size"))
             add("dflash_block_size", data.get("dflash_block_size"))
             add("dflash_verify_mode", data.get("dflash_verify_mode"))
+            add("dflash_context_copy", bool(data.get("dflash_context_copy", False)))
 
         vlm_mtp_active = bool(data.get("vlm_mtp_enabled", False)) and has_value(
             "vlm_mtp_draft_model"
@@ -4514,6 +4515,9 @@ class EnginePool:
                     )
                     drafter = None
                 if drafter is not None:
+                    drafter.context_copy = bool(
+                        getattr(model_settings, "dflash_context_copy", False)
+                    )
                     engine.set_dflash_drafter(drafter)
 
             # MiniMax M3.1 bundles its DSpark draft in dspark/; Lightning MTP
