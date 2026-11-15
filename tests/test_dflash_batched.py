@@ -1322,3 +1322,22 @@ def test_prefix_hit_without_drafter_context_recomputes_the_window(
         scheduler, SimpleNamespace(prompt_token_ids=[0] * 40, request_id="t"), table
     )
     assert table.num_tokens == 36
+
+
+def test_context_store_names_a_drafter_with_packed_projections(
+    monkeypatch, tmp_path
+):
+    """A 4-bit drafter whose projection is packed (no ``weight``) still gets
+    its store; it used to raise at the end of the first long request."""
+    from types import SimpleNamespace
+
+    drafter = _stored_drafter(monkeypatch, tmp_path)
+    packed = SimpleNamespace(
+        packed_weight=mx.zeros((64,), dtype=mx.uint32),
+        packed_scales=mx.ones((8,), dtype=mx.bfloat16),
+    )
+    holder = drafter.model.encoder if hasattr(drafter.model, "encoder") else drafter.model
+    monkeypatch.setattr(holder, "fc", packed, raising=False)
+    store = drafter.context_store()
+    assert store is not None
+    assert not drafter._store_failed
