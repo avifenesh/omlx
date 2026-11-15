@@ -753,3 +753,50 @@ def test_prefill_blocks_keep_the_fused_route():
     assert (
         affine4._native_attention(cache, q, *cache.state, 0.125, "causal") is not None
     )
+
+
+@pytest.mark.parametrize("dim,rows", [(256, 25), (256, 61), (256, 96), (128, 30), (128, 36)])
+@pytest.mark.parametrize("cache_class", [Affine4KVCache, Affine8KVCache])
+@pytest.mark.parametrize("with_sinks", [False, True])
+def test_causal_rows_over_the_native_limit_run_in_slices(
+    monkeypatch, dim, rows, cache_class, with_sinks
+):
+    """25+ causal rows run as native slices, each ending its rows early."""
+    require_tensor_ops()
+    heads, repeats, tokens = 2, 3, 1500
+    cache = cache_class()
+    cache.update_and_fetch(
+        random((1, heads, tokens, dim), mx.bfloat16),
+        random((1, heads, tokens, dim), mx.bfloat16, 1),
+    )
+    q = random((1, heads * repeats, rows, dim), mx.bfloat16, 2)
+    sinks = mx.linspace(4, 9, heads * repeats) if with_sinks else None
+    calls = []
+    native = affine4._native_attention
+
+    def counting(*args, **kwargs):
+        out = native(*args, **kwargs)
+        calls.append((args[1].shape[-2], kwargs.get("end_trim", 0), out is not None))
+        return out
+
+    monkeypatch.setattr(affine4, "_native_attention", counting)
+    sliced = cache.attention(q, scale=dim**-0.5, mask="causal", sinks=sinks)
+    starts = range(0, rows, affine4._MAX_NATIVE_QUERY_LENGTH)
+    expected = [
+        (min(s + affine4._MAX_NATIVE_QUERY_LENGTH, rows) - s,
+         rows - min(s + affine4._MAX_NATIVE_QUERY_LENGTH, rows), True)
+        for s in starts
+    ]
+    assert calls[1:] == expected
+    monkeypatch.setattr(affine4, "_native_attention", native)
+    monkeypatch.setattr(affine4, "_tensor_ops_available", lambda: False)
+    portable = cache.attention(q, scale=dim**-0.5, mask="causal", sinks=sinks)
+    close(sliced, portable, atol=6e-3)
+
+
+def test_causal_rows_past_the_sliced_limit_keep_the_fused_route(monkeypatch):
+    require_tensor_ops()
+    cache = Affine8KVCache()
+    cache.update_and_fetch(random((1, 2, 1500, 128)), random((1, 2, 1500, 128), seed=1))
+    q = random((1, 6, affine4._MAX_SLICED_QUERY_LENGTH_SMALL_DIM + 1, 128), seed=2)
+    assert affine4._native_attention_in_slices(cache, q, *cache.state, 128**-0.5, "causal", None) is None

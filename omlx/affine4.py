@@ -1360,6 +1360,51 @@ def _register_attention(
         return None
 
 
+# A causal call just over the native kernel's row limit (an appended chunk
+# or a new question of a few dozen tokens) runs as slices of the limit
+# instead of dequantizing the whole K/V for fused SDPA. M5 Pro, 245K affine8
+# tokens, 4 KV heads, one layer call: head dim 256 at 30 rows 49.7 -> 20.3 ms,
+# at 96 rows 76.0 -> 59.0 ms, even at 128; head dim 128 at 30 rows
+# 28.7 -> 18.6 ms, slower from 48 rows. The fused route also writes a bf16
+# copy of the whole K/V (~1 GB per call at 245K, head dim 256).
+_MAX_SLICED_QUERY_LENGTH = 96
+_MAX_SLICED_QUERY_LENGTH_SMALL_DIM = 36
+
+
+def _native_attention_in_slices(
+    cache, queries, keys_state, values_state, scale, mask, sinks
+) -> mx.array | None:
+    query_length = queries.shape[-2]
+    limit = (
+        _MAX_SLICED_QUERY_LENGTH
+        if queries.shape[-1] > 128
+        else _MAX_SLICED_QUERY_LENGTH_SMALL_DIM
+    )
+    if not (
+        isinstance(mask, str)
+        and mask == "causal"
+        and _MAX_NATIVE_QUERY_LENGTH < query_length <= limit
+    ):
+        return None
+    parts = []
+    for start in range(0, query_length, _MAX_NATIVE_QUERY_LENGTH):
+        end = min(start + _MAX_NATIVE_QUERY_LENGTH, query_length)
+        part = _native_attention(
+            cache,
+            queries[:, :, start:end],
+            keys_state,
+            values_state,
+            scale,
+            mask,
+            sinks,
+            end_trim=query_length - end,
+        )
+        if part is None:
+            return None
+        parts.append(part)
+    return mx.concatenate(parts, axis=2)
+
+
 def _native_attention(
     cache,
     queries: mx.array,
@@ -1368,7 +1413,10 @@ def _native_attention(
     scale: float,
     mask,
     sinks: mx.array | None = None,
+    end_trim: int = 0,
 ) -> mx.array | None:
+    """``end_trim`` ends every row that many keys early: the causal mask of a
+    slice of query rows that is not the last one in the call."""
     if (
         mx.default_device() != mx.gpu
         or not _tensor_ops_available()
@@ -1452,6 +1500,8 @@ def _native_attention(
         valid_ends = mx.array([min(int(e), tokens) for e in row_ends], dtype=mx.int32)
     else:
         valid_ends = mx.full((batch,), tokens, dtype=mx.int32)
+    if end_trim:
+        valid_ends = mx.maximum(valid_ends - end_trim, 0)
 
     if _use_register_kernel(cache.key_codec.bits, dim, total_rows, tokens):
         output = _register_attention(
@@ -1977,6 +2027,10 @@ class Affine4KVCache(TurboQuantKVCache):
         output = _native_attention(
             self, queries, keys_state, values_state, scale, mask, sinks
         )
+        if output is None:
+            output = _native_attention_in_slices(
+                self, queries, keys_state, values_state, scale, mask, sinks
+            )
         if output is not None:
             return output
         effective_mask = self._attention_mask(
