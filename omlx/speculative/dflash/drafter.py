@@ -305,18 +305,31 @@ class DFlashDrafter:
         if not context_store.store_enabled() or self.store_namespace is None:
             return None
         fc = self.model.encoder.fc if hasattr(self.model, "encoder") else self.model.fc
-        dtype = fc.scales.dtype if hasattr(fc, "scales") else fc.weight.dtype
+        # Plain, quantized and packed (4-bit drafter projections) layers keep
+        # their weights under different names.
+        weight = getattr(fc, "weight", None)
+        if weight is None:
+            weight = getattr(fc, "packed_weight", None)
+        scales = getattr(fc, "scales", None)
+        if scales is None:
+            scales = getattr(fc, "packed_scales", None)
+        dtype = (scales if scales is not None else weight).dtype if weight is not None else None
         if dtype not in context_store._BITS:
             self._store_failed = True
             return None
-        # The projection weights (and their load-time quantization) decide
-        # the rows; a slice of them names the drafter build.
-        probe = [fc.weight.reshape(-1)[:4096]]
-        if hasattr(fc, "scales"):
-            probe.append(fc.scales.reshape(-1)[:4096])
-        digest = hashlib.sha1()
-        for part in probe:
-            digest.update(np.array(part.view(mx.uint8)).tobytes())
+        try:
+            # The projection weights (and their load-time quantization) decide
+            # the rows; a slice of them names the drafter build.
+            probe = [weight.reshape(-1)[:4096]]
+            if scales is not None:
+                probe.append(scales.reshape(-1)[:4096])
+            digest = hashlib.sha1()
+            for part in probe:
+                digest.update(np.array(part.view(mx.uint8)).tobytes())
+        except Exception as exc:  # noqa: BLE001 - the store is optional
+            logger.warning("DFlash context store unavailable: %r", exc)
+            self._store_failed = True
+            return None
         parts = [
             str(self.source_path),
             self.store_namespace,
