@@ -754,9 +754,9 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         mx.eval(self.keys, self.values)
         self._cached_state = None
         self._cached_state_offset = -1
-        from .cache.prefix_cache import _RESTORE_POOL_FLUSH_BYTES, BlockAwarePrefixCache
+        from .cache.prefix_cache import BlockAwarePrefixCache, pool_flush_bytes
 
-        BlockAwarePrefixCache._flush_restore_pool_if_over(_RESTORE_POOL_FLUSH_BYTES)
+        BlockAwarePrefixCache._flush_restore_pool_if_over(pool_flush_bytes())
 
     def extend(self, other: "BatchTurboQuantKVCache"):
         if not isinstance(other, BatchTurboQuantKVCache):
