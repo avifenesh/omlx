@@ -5139,6 +5139,32 @@ class TestPeriodicClearGating:
         with patch.object(sched_mod.mx, "get_cache_memory", return_value=3 * 1024**3):
             assert scheduler._should_periodic_clear_cache() is True
 
+    @pytest.mark.parametrize("max_num_seqs,expected", [(2, True), (1, False)])
+    def test_multi_session_scheduler_clears_a_smaller_pool_more_often(
+        self, mock_model, mock_tokenizer, max_num_seqs, expected
+    ):
+        """With 2+ requests in flight on a scheduler that allows them, a pool
+        above 1 GiB is cleared every 32 steps; otherwise the stock rule."""
+        from omlx import scheduler as sched_mod
+        from omlx.cache import prefix_cache
+
+        config = SchedulerConfig(max_num_seqs=max_num_seqs)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler._step_counter = 32
+        scheduler._memory_limit_bytes = 0
+        scheduler.running = {"a": object(), "b": object()}
+        with patch.object(sched_mod.mx, "get_cache_memory", return_value=int(1.5 * 1024**3)):
+            assert scheduler._should_periodic_clear_cache() is expected
+            # One request in flight keeps the stock rule either way.
+            scheduler.running = {"a": object()}
+            assert scheduler._should_periodic_clear_cache() is False
+        assert prefix_cache.pool_flush_bytes() == (
+            prefix_cache._MULTI_SESSION_POOL_FLUSH_BYTES
+            if max_num_seqs >= 2
+            else prefix_cache._RESTORE_POOL_FLUSH_BYTES
+        )
+        prefix_cache.set_pool_flush_bytes(None)
+
     def test_periodic_clear_threshold_scales_with_memory_limit(
         self, mock_model, mock_tokenizer
     ):

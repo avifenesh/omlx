@@ -59,7 +59,10 @@ from .cache.observability import BoundarySnapshotDiagnostics, CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
 from .cache.prefix_cache import (
+    _MULTI_SESSION_POOL_FLUSH_BYTES,
     _RESTORE_POOL_FLUSH_BYTES,
+    pool_flush_bytes,
+    set_pool_flush_bytes,
     BlockAwarePrefixCache,
     cachelist_pm_member_plan,
 )
@@ -1134,7 +1137,6 @@ def _extend_cache_layer(cache_a: Any, cache_b: Any) -> Any:
     return cache_a
 
 
-_JOIN_POOL_FLUSH_BYTES = _RESTORE_POOL_FLUSH_BYTES
 
 
 def _patched_merge_caches(caches):
@@ -1185,7 +1187,7 @@ def _eval_cache_layer(layer: Any) -> None:
         state = None
     if state is not None:
         mx.eval(state)
-    BlockAwarePrefixCache._flush_restore_pool_if_over(_JOIN_POOL_FLUSH_BYTES)
+    BlockAwarePrefixCache._flush_restore_pool_if_over(pool_flush_bytes())
 
 
 def _patched_extend_cache(cache_a, cache_b):
@@ -2270,6 +2272,13 @@ class Scheduler:
     """
 
     _DEFERRED_CLEAR_DELAY: int = 8
+    # With 2+ concurrent requests the stock periodic clear (every
+    # mlx_cache_cleanup_interval steps, above max(limit / 3, 2 GiB)) lets the
+    # pool hold several GB next to two long sessions, which is what crosses
+    # the hard watermark when one joins or leaves. Such schedulers also clear
+    # a pool above 1 GiB every 32 steps.
+    _MULTI_SESSION_CLEAR_STEPS: int = 32
+    _MULTI_SESSION_CLEAR_BYTES: int = 1024**3
     _GENERATION_OVERFLOW_PATTERN = "__next_prime overflow"
     _MAX_GENERATION_OVERFLOW_RETRIES = 1
 
@@ -2826,6 +2835,9 @@ class Scheduler:
 
         # Step counter for periodic cleanup
         self._step_counter = 0
+        set_pool_flush_bytes(
+            _MULTI_SESSION_POOL_FLUSH_BYTES if self.config.max_num_seqs >= 2 else None
+        )
         # Deferred Metal cache cleanup after request completion.
         # Immediate mx.clear_cache() after request completion races with
         # IOKit's asynchronous completeMemory() callbacks, causing
@@ -2920,6 +2932,13 @@ class Scheduler:
         MLX buffer pool exceeds the threshold. See #978 / #1040 for the
         kernel panic class this gating is meant to mitigate.
         """
+        if (
+            self.config.max_num_seqs >= 2
+            and self._step_counter % self._MULTI_SESSION_CLEAR_STEPS == 0
+            and len(self.running) + len(getattr(self, "prefilling", ())) >= 2
+            and mx.get_cache_memory() > self._MULTI_SESSION_CLEAR_BYTES
+        ):
+            return True
         interval = self.config.mlx_cache_cleanup_interval
         if interval <= 0 or self._step_counter % interval != 0:
             return False

@@ -466,6 +466,17 @@ def _reset_decode_activity_registry():
 
 
 @pytest.fixture(autouse=True)
+def _reset_pool_flush_gate():
+    """Each Scheduler sets the process-global pool flush gate from its
+    max_num_seqs; reset it so one test's scheduler does not change another's."""
+    from omlx.cache import prefix_cache
+
+    prefix_cache.set_pool_flush_bytes(None)
+    yield
+    prefix_cache.set_pool_flush_bytes(None)
+
+
+@pytest.fixture(autouse=True)
 def _reset_vlm_mtp_attach():
     """Start each test with the process-global VLM MTP attach flag at its default.
 
