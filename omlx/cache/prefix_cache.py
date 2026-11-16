@@ -136,6 +136,23 @@ _MTP_PREFIX_SNAPSHOT_MAX_ENTRIES = 4
 # serving runs (the pool clears a few times per 1M restore) and the min-token
 # gate keeps repeated small restore churn on the lazy path.
 _RESTORE_POOL_FLUSH_BYTES = 4 * 1024**3
+# With two or more concurrent requests a session joining or leaving next to
+# another one decoding has little headroom, and freed buffers of a few GB in
+# the pool are enough to cross the hard watermark. The scheduler lowers the
+# gate to this when it allows 2+ concurrent requests.
+_MULTI_SESSION_POOL_FLUSH_BYTES = 512 * 1024**2
+_pool_flush_bytes: int | None = None
+
+
+def set_pool_flush_bytes(flush_bytes: int | None) -> None:
+    """Pool size above which restores, joins and row copies clear the pool."""
+    global _pool_flush_bytes
+    _pool_flush_bytes = None if flush_bytes is None else int(flush_bytes)
+
+
+def pool_flush_bytes() -> int:
+    """The scheduler's gate, else _RESTORE_POOL_FLUSH_BYTES."""
+    return _RESTORE_POOL_FLUSH_BYTES if _pool_flush_bytes is None else _pool_flush_bytes
 _RESTORE_BOUND_MIN_TOKENS = 65536
 
 # Depth bound for collecting a rebuilt cache object's arrays (CacheList ->
@@ -3545,7 +3562,7 @@ class BlockAwarePrefixCache(CacheManager):
 
             # Blocks are held as private list copies: dropping a consumed
             # tensor never mutates a list the SSD manager handed out.
-            flush_bytes = _RESTORE_POOL_FLUSH_BYTES
+            flush_bytes = pool_flush_bytes()
             bound_transient = (
                 flush_bytes > 0 and block_table.num_tokens >= _RESTORE_BOUND_MIN_TOKENS
             )
