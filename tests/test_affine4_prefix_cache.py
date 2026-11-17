@@ -463,7 +463,11 @@ def test_cut_leaves_recurrent_layers_whole(manager_factory):
     prefix.fetch_cache("second", list(range(16)))
     data = payload()
     recurrent_state = [mx.random.normal((1, 3, 8)), mx.random.normal((1, 2, 4, 4))]
-    recurrent = {"state": recurrent_state, "class_name": "ArraysCache", "meta_state": ""}
+    recurrent = {
+        "state": recurrent_state,
+        "class_name": "ArraysCache",
+        "meta_state": "",
+    }
     data.insert(1, recurrent)
     assert prefix.trim_store_payload("second", data) == 8
     assert data[1] is recurrent and data[1]["state"] is recurrent_state
@@ -499,3 +503,51 @@ def test_payload_without_a_stored_prefix_is_left_whole(manager_factory):
     before = data[0]["state"]
     assert prefix.trim_store_payload("fresh", data) == 0
     assert data[0]["state"] is before and "token_base" not in data[0]
+
+
+def _live8(length, seed=7):
+    cache = Affine8KVCache(bits=8, seed=seed)
+    cache.update_and_fetch(
+        mx.random.normal((1, 2, length, 16)).astype(mx.float16),
+        mx.random.normal((1, 2, length, 16)).astype(mx.float16),
+    )
+    mx.eval(cache.state)
+    return cache
+
+
+def _stored_prefix(manager_factory, cache, tokens):
+    manager = manager_factory(types=["Affine8KVCache"])
+    manager.set_expected_layer_signature(["Affine8KVCache"], turboquant_kv_bits=8)
+    prefix, _ = _prefix(manager)
+    assert prefix.store_cache("store", tokens, [_data(cache)]) is not None
+    manager.close()
+    prefix.release_cache("store")
+    return prefix
+
+
+def test_resident_layer_is_trimmed_in_place(manager_factory):
+    live = _live8(8)
+    expected = _payload(live, end=8, marker="__affine8__")[1]
+    prefix = _stored_prefix(manager_factory, live, list(range(8)))
+    live.update_and_fetch(
+        mx.random.normal((1, 2, 4, 16)).astype(mx.float16),
+        mx.random.normal((1, 2, 4, 16)).astype(mx.float16),
+    )  # the answer the finished request generated
+    mx.eval(live.state)
+    table, remaining = prefix.fetch_cache("reuse", list(range(8)) + [99])
+    assert table is not None and table.num_tokens == 8 and remaining == [99]
+    restored = prefix.reconstruct_cache(table, resident_layers={0: live})
+    assert restored is not None and restored[0] is live
+    assert live.offset == 8
+    _assert_state_equal(expected, _state(live))
+
+
+def test_resident_layer_with_other_codec_is_not_used(manager_factory):
+    live = _live8(8)
+    prefix = _stored_prefix(manager_factory, live, list(range(8)))
+    other = _live8(12, seed=8)
+    table, _ = prefix.fetch_cache("reuse", list(range(8)) + [99])
+    restored = prefix.reconstruct_cache(table, resident_layers={0: other})
+    assert restored is not None and restored[0] is not other
+    assert other.offset == 12
+    assert restored[0].offset == 8
