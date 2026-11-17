@@ -1990,11 +1990,6 @@ def _mimo_fused_full_attention() -> bool:
         return False
 
 
-# Keep a session lane only while active memory stays below this share of the
-# memory ceiling.
-_SESSION_LANE_MAX_ACTIVE = 0.85
-
-
 @dataclass
 class SchedulerConfig:
     """Configuration for the scheduler."""
@@ -11543,16 +11538,6 @@ class Scheduler:
         self._drop_session_lane()
         if not getattr(self.config, "session_lane", False):
             return
-        # A lane that keeps the footprint near the soft watermark pauses the
-        # next admission until the pool drains, and the headroom reclaim then
-        # drops it anyway: keep it only with room to spare.
-        ceiling = int(
-            getattr(self, "_memory_dynamic_ceiling_bytes", 0)
-            or getattr(self, "_memory_static_ceiling_bytes", 0)
-            or 0
-        )
-        if ceiling > 0 and mx.get_active_memory() > _SESSION_LANE_MAX_ACTIVE * ceiling:
-            return
         if not isinstance(raw_cache, (list, tuple)):
             return
         layers = {}
@@ -11562,8 +11547,25 @@ class Scheduler:
                     return
                 layers[idx] = cache
         prompt = getattr(request, "prompt_token_ids", None)
-        if layers and prompt:
-            self._session_lane = (list(prompt), layers)
+        if not layers or not prompt:
+            return
+        # Route preflight charges the next request's whole prompt before the
+        # prefix hit is known. If the kept KV plus that charge crosses the
+        # admission line, the next request waits out the preflight cleanup
+        # window and the headroom reclaim drops the lane anyway.
+        limit_fn = getattr(self, "_admission_limit_bytes", None)
+        limit = int(limit_fn()) if callable(limit_fn) else 0
+        if limit > 0:
+            lane_bytes = sum(
+                part.nbytes
+                for cache in layers.values()
+                for state in (cache.keys, cache.values)
+                for part in (state if isinstance(state, tuple) else (state,))
+                if hasattr(part, "nbytes")
+            )
+            if mx.get_active_memory() + lane_bytes > limit:
+                return
+        self._session_lane = (list(prompt), layers)
 
     def _drop_session_lane(self) -> None:
         self._session_lane = None
