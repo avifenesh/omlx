@@ -63,6 +63,8 @@ _DEQUANTIZE_LAUNCHABLE = {}
 # tensor ops). OMLX_ATTN_Q8Q=0 turns it off.
 _Q8Q_ATTENTION = __import__("os").environ.get("OMLX_ATTN_Q8Q", "1") == "1"
 _Q8Q_MIN_KEYS = int(__import__("os").environ.get("OMLX_ATTN_Q8Q_MIN_KEYS", "16384"))
+_Q8Q_SPLIT = int(__import__("os").environ.get("OMLX_ATTN_Q8Q_SPLIT", "8"))
+_Q8Q_SPLIT_MIN_KEYS = 65536
 
 
 def _q8q_prefill_attention(cache, queries, keys_state, values_state, scale):
@@ -73,18 +75,18 @@ def _q8q_prefill_attention(cache, queries, keys_state, values_state, scale):
     vs = getattr(values_state, "_state", values_state)
     if not (hasattr(ks, "indices") and hasattr(vs, "indices")):
         return None
-    B, H, rows, D = queries.shape
-    T = int(ks.indices.shape[-2])
-    Hk = int(ks.indices.shape[1])
+    batch, heads, rows, dim = queries.shape
+    tokens = int(ks.indices.shape[-2])
+    kv_heads = int(ks.indices.shape[1])
     if (
-        B != 1
-        or D != 256
-        or Hk <= 0
-        or H % Hk
+        batch != 1
+        or dim != 256
+        or kv_heads <= 0
+        or heads % kv_heads
         or rows % 8
-        or rows > T
-        or T < _Q8Q_MIN_KEYS
-        or int(vs.indices.shape[-2]) != T
+        or rows > tokens
+        or tokens < _Q8Q_MIN_KEYS
+        or int(vs.indices.shape[-2]) != tokens
     ):
         return None
     from .utils import q8q_attention as _q8q
@@ -92,7 +94,10 @@ def _q8q_prefill_attention(cache, queries, keys_state, values_state, scale):
     rotated_queries = cache.key_codec.prepare_queries(queries).astype(mx.bfloat16)
     k = _q8q.prepare_kv(ks.indices, ks.norms)
     v = _q8q.prepare_kv(vs.indices, vs.norms)
-    rotated_output = _q8q.run(rotated_queries, k, v, scale)
+    # Long histories run several threadgroups per tile (shorter threadgroups
+    # keep the GPU busier); short ones gain nothing from the extra combine.
+    split = _Q8Q_SPLIT if tokens >= _Q8Q_SPLIT_MIN_KEYS else 1
+    rotated_output = _q8q.run(rotated_queries, k, v, scale, split=split)
     output = cache.value_codec._rotate_inverse(rotated_output).astype(queries.dtype)
     mx.eval(output)
     output = mx.array(output)
