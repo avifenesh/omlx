@@ -13852,6 +13852,26 @@ class Scheduler:
             limit_bytes=safety_rejection.limit_bytes,
         )
 
+    def preflight_cached_tokens(self, token_ids: list[int]) -> int:
+        """Prompt tokens the prefix cache already holds, for route preflight.
+
+        Route preflight runs before the request's prefix lookup, so without
+        this a new question on a cached long document is charged as a full
+        prefill. Read-only; 0 when the cache cannot answer.
+        """
+        cache = self.block_aware_cache
+        paged = getattr(cache, "paged_cache", None) if cache is not None else None
+        if paged is None or not token_ids:
+            return 0
+        if self._model_has_unreconstructible_cache():
+            return 0
+        try:
+            cached = int(paged.count_cached_prefix_tokens(list(token_ids)))
+        except Exception:  # noqa: BLE001 - the estimate falls back to a full prefill
+            return 0
+        # The last prompt token is always prefilled.
+        return max(0, min(cached, len(token_ids) - 1))
+
     def preflight_eviction_request(
         self,
         *,

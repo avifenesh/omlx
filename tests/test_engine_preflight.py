@@ -1132,3 +1132,35 @@ class TestRejectionMessageNamesBindingCeiling:
         assert "memory_guard_tier" in rej.message
         assert "iogpu.wired_limit_mb" not in rej.message
         assert "custom_ceiling_bytes" not in rej.message
+
+
+async def test_preflight_charges_only_the_uncached_prompt():
+    """A prompt the prefix cache already holds is charged for its suffix."""
+    scheduler = MagicMock()
+    scheduler.preflight_eviction_request.return_value = None
+    await _run_scheduler_preflight_with_cleanup_retry(
+        scheduler,
+        num_prompt_tokens=245000,
+        request_id="cached",
+        eviction_callback=None,
+        cached_tokens=244000,
+    )
+    scheduler.preflight_eviction_request.assert_called_once_with(
+        num_prompt_tokens=245000, cached_tokens=244000, request_id="cached"
+    )
+    scheduler.preflight_or_raise.assert_called_once_with(
+        num_prompt_tokens=245000, cached_tokens=244000, request_id="cached"
+    )
+
+
+def test_scheduler_probe_keeps_the_last_token_and_needs_a_cache():
+    from omlx.scheduler import Scheduler
+
+    paged = SimpleNamespace(count_cached_prefix_tokens=lambda tokens: len(tokens))
+    sched = SimpleNamespace(
+        block_aware_cache=SimpleNamespace(paged_cache=paged),
+        _model_has_unreconstructible_cache=lambda: False,
+    )
+    assert Scheduler.preflight_cached_tokens(sched, [1, 2, 3, 4]) == 3
+    sched.block_aware_cache = None
+    assert Scheduler.preflight_cached_tokens(sched, [1, 2, 3, 4]) == 0
