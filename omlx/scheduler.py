@@ -11551,14 +11551,7 @@ class Scheduler:
             or getattr(self, "_memory_static_ceiling_bytes", 0)
             or 0
         )
-        active = mx.get_active_memory()
-        if ceiling > 0 and active > _SESSION_LANE_MAX_ACTIVE * ceiling:
-            logger.info(
-                "Session lane not kept: active %.1f GB above %.0f%% of %.1f GB",
-                active / 1e9,
-                _SESSION_LANE_MAX_ACTIVE * 100,
-                ceiling / 1e9,
-            )
+        if ceiling > 0 and mx.get_active_memory() > _SESSION_LANE_MAX_ACTIVE * ceiling:
             return
         if not isinstance(raw_cache, (list, tuple)):
             return
@@ -11571,16 +11564,8 @@ class Scheduler:
         prompt = getattr(request, "prompt_token_ids", None)
         if layers and prompt:
             self._session_lane = (list(prompt), layers)
-            logger.info(
-                "Session lane kept: %d layers, active %.1f GB, ceiling %.1f GB",
-                len(layers),
-                active / 1e9,
-                ceiling / 1e9,
-            )
 
     def _drop_session_lane(self) -> None:
-        if getattr(self, "_session_lane", None) is not None:
-            logger.info("Session lane dropped")
         self._session_lane = None
 
     def _take_session_lane(
