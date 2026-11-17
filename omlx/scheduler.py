@@ -11703,12 +11703,12 @@ class Scheduler:
                 original_tokens = block_table.num_tokens
                 reconstruct_started = time.perf_counter()
                 with self._phase_timer("prefix_cache_reconstruct"):
+                    resident = self._take_session_lane(request, block_table.num_tokens)
+                    lane_kwargs = {"resident_layers": resident} if resident else {}
                     reconstructed = self.block_aware_cache.reconstruct_cache(
                         block_table,
                         promote_to_hot_cache=not bypass_hot_cache,
-                        resident_layers=self._take_session_lane(
-                            request, block_table.num_tokens
-                        ),
+                        **lane_kwargs,
                     )
                 reconstruct_ms = (time.perf_counter() - reconstruct_started) * 1000.0
                 if block_table.num_tokens < minimum_prefix:
