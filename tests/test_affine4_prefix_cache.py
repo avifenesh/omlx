@@ -329,3 +329,49 @@ def test_affine8_prefix_and_ssd_roundtrip(manager_factory):
     _assert_state_equal(_state(cache), _state(restored[0]))
 
 
+def _live8(length, seed=7):
+    cache = Affine8KVCache(bits=8, seed=seed)
+    cache.update_and_fetch(
+        mx.random.normal((1, 2, length, 16)).astype(mx.float16),
+        mx.random.normal((1, 2, length, 16)).astype(mx.float16),
+    )
+    mx.eval(cache.state)
+    return cache
+
+
+def _stored_prefix(manager_factory, cache, tokens):
+    manager = manager_factory(types=["Affine8KVCache"])
+    manager.set_expected_layer_signature(["Affine8KVCache"], turboquant_kv_bits=8)
+    prefix, _ = _prefix(manager)
+    assert prefix.store_cache("store", tokens, [_data(cache)]) is not None
+    manager.close()
+    prefix.release_cache("store")
+    return prefix
+
+
+def test_resident_layer_is_trimmed_in_place(manager_factory):
+    live = _live8(8)
+    expected = _payload(live, end=8, marker="__affine8__")[1]
+    prefix = _stored_prefix(manager_factory, live, list(range(8)))
+    live.update_and_fetch(
+        mx.random.normal((1, 2, 4, 16)).astype(mx.float16),
+        mx.random.normal((1, 2, 4, 16)).astype(mx.float16),
+    )  # the answer the finished request generated
+    mx.eval(live.state)
+    table, remaining = prefix.fetch_cache("reuse", list(range(8)) + [99])
+    assert table is not None and table.num_tokens == 8 and remaining == [99]
+    restored = prefix.reconstruct_cache(table, resident_layers={0: live})
+    assert restored is not None and restored[0] is live
+    assert live.offset == 8
+    _assert_state_equal(expected, _state(live))
+
+
+def test_resident_layer_with_other_codec_is_not_used(manager_factory):
+    live = _live8(8)
+    prefix = _stored_prefix(manager_factory, live, list(range(8)))
+    other = _live8(12, seed=8)
+    table, _ = prefix.fetch_cache("reuse", list(range(8)) + [99])
+    restored = prefix.reconstruct_cache(table, resident_layers={0: other})
+    assert restored is not None and restored[0] is not other
+    assert other.offset == 12
+    assert restored[0].offset == 8
