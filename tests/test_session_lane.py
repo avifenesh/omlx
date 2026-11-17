@@ -65,3 +65,10 @@ def test_lane_needs_the_setting_and_live_state():
     emptied.filter([])
     Scheduler._keep_session_lane(sched, _request(range(10)), [emptied])
     assert sched._session_lane is None
+
+
+def test_lane_is_not_kept_without_memory_headroom():
+    sched = _scheduler()
+    sched._memory_dynamic_ceiling_bytes = 1
+    Scheduler._keep_session_lane(sched, _request(range(10)), [_live(12)])
+    assert sched._session_lane is None
