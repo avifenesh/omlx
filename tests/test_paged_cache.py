@@ -921,29 +921,6 @@ class TestPagedCacheManager:
         assert manager.cached_block_hash_to_block.get_block(hash1) is not None
         assert manager.cached_block_hash_to_block.get_block(hash2) is not None
 
-    def test_count_cached_prefix_tokens_matches_lookup_without_side_effects(self):
-        """The preflight probe counts what get_computed_blocks would hit, but
-        neither counts stats nor registers SSD blocks."""
-        manager = PagedCacheManager(
-            block_size=4, max_blocks=100, model_name="test-model", initial_blocks=100
-        )
-        tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
-        hash1 = compute_block_hash(None, [1, 2, 3, 4], model_name="test-model")
-        hash2 = compute_block_hash(hash1, [5, 6, 7, 8], model_name="test-model")
-        mock_ssd = MagicMock(spec=[])
-        mock_ssd.has_block = MagicMock(side_effect=lambda h: h in (hash1, hash2))
-        manager._paged_ssd_cache_manager = mock_ssd
-        hits, misses = manager.stats.hits, manager.stats.misses
-
-        assert manager.count_cached_prefix_tokens(tokens) == 8
-        assert (manager.stats.hits, manager.stats.misses) == (hits, misses)
-        assert manager.cached_block_hash_to_block.get_block(hash1) is None
-        assert manager.count_cached_prefix_tokens([9, 9, 9, 9, 1]) == 0
-
-        _, num_tokens = manager.get_computed_blocks(tokens)
-        assert num_tokens == 8
-        assert manager.count_cached_prefix_tokens(tokens) == 8
-
     def test_get_computed_blocks_ssd_fallback_partial(self):
         """Test SSD fallback with partial hit (first block on SSD, second not)."""
         manager = PagedCacheManager(

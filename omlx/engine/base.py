@@ -91,7 +91,6 @@ async def _run_scheduler_preflight_with_cleanup_retry(
     request_id: str | None,
     eviction_callback: Any | None,
     executor: Any | None = None,
-    cached_tokens: int = 0,
 ) -> None:
     """Run route preflight after transient post-request cleanup settles.
 
@@ -105,21 +104,17 @@ async def _run_scheduler_preflight_with_cleanup_retry(
     request state, synchronizes a stream, or clears the Metal pool, so active
     batched work is not interrupted.
     """
-    # Only a prefix-cache hit changes the charge; keep the plain call otherwise.
-    cached_kw = {"cached_tokens": cached_tokens} if cached_tokens > 0 else {}
     deadline = time.monotonic() + _PREFLIGHT_CLEANUP_WAIT_TIMEOUT_S
     waited_for_cleanup = False
 
     while True:
         eviction_request = scheduler.preflight_eviction_request(
             num_prompt_tokens=num_prompt_tokens,
-            **cached_kw,
             request_id=request_id,
         )
         if eviction_request is None:
             scheduler.preflight_or_raise(
                 num_prompt_tokens=num_prompt_tokens,
-                **cached_kw,
                 request_id=request_id,
             )
             return
@@ -195,7 +190,6 @@ async def _run_scheduler_preflight_with_cleanup_retry(
                 await loop.run_in_executor(executor, refresh_usage)
         scheduler.preflight_or_raise(
             num_prompt_tokens=num_prompt_tokens,
-            **cached_kw,
             request_id=request_id,
         )
         return
