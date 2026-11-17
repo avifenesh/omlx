@@ -3487,9 +3487,15 @@ class BlockAwarePrefixCache(CacheManager):
         self,
         block_table: BlockTable,
         promote_to_hot_cache: bool = True,
+        resident_layers: dict[int, Any] | None = None,
     ) -> list[Any] | None:
         """
         Reconstruct cache objects from paged SSD-stored block data.
+
+        ``resident_layers`` maps layer indices to live affine caches that
+        already hold the first ``block_table.num_tokens`` tokens (the
+        scheduler's session lane). Those layers are trimmed in place and
+        returned as they are instead of joining their blocks.
 
         This method supports multiple cache types (KVCache, RotatingKVCache,
         ArraysCache) and uses stored type information for proper reconstruction.
@@ -4123,6 +4129,20 @@ class BlockAwarePrefixCache(CacheManager):
                     cache_class = (
                         Affine8KVCache if expected_scheme == "affine8" else Affine4KVCache
                     )
+                    resident = (resident_layers or {}).get(layer_idx)
+                    if (
+                        type(resident) is cache_class
+                        and resident.offset >= block_table.num_tokens
+                        and all_block_meta_states
+                        and all_block_meta_states[0]
+                    ):
+                        meta = _validate_affine_meta(
+                            all_block_meta_states[0][layer_idx], expected_scheme
+                        )
+                        if tuple(meta[1:]) == tuple(resident.meta_state[1:]):
+                            resident.trim(resident.offset - block_table.num_tokens)
+                            reconstructed_caches.append(resident)
+                            continue
                     parts = []
                     affine_meta = None
                     for block_idx, block_data in enumerate(all_block_data):
