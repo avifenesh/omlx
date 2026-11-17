@@ -2006,6 +2006,9 @@ class SchedulerConfig:
 
     # Maximum number of concurrent requests in the batch
     max_num_seqs: int = 256
+    # Keep a finished single request's attention KV resident; the next request
+    # on the same prompt prefix reuses it instead of joining SSD blocks.
+    session_lane: bool = True
     # Maximum tokens to process per step (for prefill chunking)
     max_num_batched_tokens: int = 8192
     # Scheduling policy
@@ -6724,6 +6727,7 @@ class Scheduler:
         Returns:
             ``max(active, phys_footprint)`` after reclaim.
         """
+        self._drop_session_lane()
         Scheduler._clear_cache(self)
         return self._current_usage_bytes()
 
@@ -11560,6 +11564,61 @@ class Scheduler:
         self._unreconstructible_cache_model = result
         return result
 
+    def _keep_session_lane(self, request: Request, raw_cache: Any) -> None:
+        """Keep a finished request's attention caches for the next request.
+
+        At batch size 1 the response holds the live per-layer cache objects.
+        A next request on the same prompt prefix reuses them, trimmed to its
+        prefix-cache hit, instead of joining the hit's blocks. Only plain
+        affine attention caches qualify; other layers come from the hit's
+        blocks and snapshots as before. One lane at a time.
+        """
+        from .affine4 import Affine4KVCache, Affine8KVCache
+
+        self._drop_session_lane()
+        if not getattr(self.config, "session_lane", False):
+            return
+        if not isinstance(raw_cache, (list, tuple)):
+            return
+        layers = {}
+        for idx, cache in enumerate(raw_cache):
+            if type(cache) in (Affine4KVCache, Affine8KVCache):
+                if cache.keys is None or cache.values is None:
+                    return
+                layers[idx] = cache
+        prompt = getattr(request, "prompt_token_ids", None)
+        if layers and prompt:
+            self._session_lane = (list(prompt), layers)
+
+    def _drop_session_lane(self) -> None:
+        self._session_lane = None
+
+    def _take_session_lane(
+        self, request: Request, cached: int
+    ) -> dict[int, Any] | None:
+        """The kept attention caches when they hold ``request``'s first ``cached`` tokens."""
+        lane = getattr(self, "_session_lane", None)
+        self._session_lane = None
+        if lane is None:
+            return None
+        prompt, layers = lane
+        tokens = request.prompt_token_ids
+        if (
+            cached <= 0
+            or cached > len(prompt)
+            or len(tokens) < cached
+            or any(c.offset < cached or c.keys is None for c in layers.values())
+            or prompt[:cached] != list(tokens[:cached])
+        ):
+            return None
+        logger.info(
+            "Request %s reuses %d resident attention layers at token %d",
+            request.request_id,
+            len(layers),
+            cached,
+        )
+        return layers
+
     def _prepare_prefix_cache_for_request(self, request: Request) -> None:
         if request.request_id in self._prefix_cache_prepared:
             return
@@ -11623,6 +11682,8 @@ class Scheduler:
                 if self.paged_cache_manager is not None:
                     self.paged_cache_manager.delete_block_table(request.request_id)
                 block_table = None
+            if not (block_table and block_table.num_tokens > 0):
+                self._drop_session_lane()
             if block_table and block_table.num_tokens > 0:
                 bypass_hot_cache = self._bypass_hot_cache_under_pressure()
                 if bypass_hot_cache:
@@ -11645,6 +11706,9 @@ class Scheduler:
                     reconstructed = self.block_aware_cache.reconstruct_cache(
                         block_table,
                         promote_to_hot_cache=not bypass_hot_cache,
+                        resident_layers=self._take_session_lane(
+                            request, block_table.num_tokens
+                        ),
                     )
                 reconstruct_ms = (time.perf_counter() - reconstruct_started) * 1000.0
                 if block_table.num_tokens < minimum_prefix:
@@ -12801,6 +12865,7 @@ class Scheduler:
         if not self._pending_pressure_clear:
             return False
         self._pending_pressure_clear = False
+        self._drop_session_lane()
         return True
 
     def _process_pending_reclaim(self) -> None:
@@ -14989,6 +15054,7 @@ class Scheduler:
                                 self._capture_finished_boundary_snapshot(
                                     request, raw_cache
                                 )
+                                self._keep_session_lane(request, raw_cache)
                                 logger.debug(
                                     f"Extracted {len(extracted_cache)} layer states "
                                     f"for request {request_id}"
