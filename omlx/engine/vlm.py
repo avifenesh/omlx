@@ -1764,10 +1764,17 @@ class VLMBatchedEngine(BaseEngine):
         *,
         num_prompt_tokens: int,
         request_id: str | None,
+        prompt_token_ids: list[int] | None = None,
     ) -> None:
+        # Charge only what the prefix cache does not hold already.
+        cached_tokens = 0
+        probe = getattr(scheduler, "preflight_cached_tokens", None)
+        if prompt_token_ids and callable(probe):
+            cached_tokens = int(probe(prompt_token_ids) or 0)
         await _run_scheduler_preflight_with_cleanup_retry(
             scheduler,
             num_prompt_tokens=num_prompt_tokens,
+            cached_tokens=cached_tokens,
             request_id=request_id,
             eviction_callback=self._prefill_eviction_callback,
             executor=getattr(
@@ -5339,8 +5346,10 @@ class VLMBatchedEngine(BaseEngine):
                 field="messages",
             )
         prepared = kwargs.get("_prepared_prompt")
+        token_ids = None
         if prepared is not None:
-            num_tokens = len(prepared[1])
+            token_ids = list(prepared[1])
+            num_tokens = len(token_ids)
         else:
             prompt = self._apply_chat_template(
                 text_messages,
@@ -5355,7 +5364,8 @@ class VLMBatchedEngine(BaseEngine):
             # the real chat path surface the same error through the existing
             # handler chain.
             try:
-                num_tokens = len(self._tokenizer.encode(prompt))
+                token_ids = self._tokenizer.encode(prompt)
+                num_tokens = len(token_ids)
             except Exception as e:
                 logger.warning(
                     "VLMBatchedEngine.preflight_chat: tokenizer.encode raised "
@@ -5390,6 +5400,8 @@ class VLMBatchedEngine(BaseEngine):
             scheduler,
             num_prompt_tokens=num_tokens,
             request_id=request_id,
+            # Image and video blocks hash with extra keys the probe does not see.
+            prompt_token_ids=None if images or videos else token_ids,
         )
 
     async def preflight_completion(
@@ -5408,7 +5420,8 @@ class VLMBatchedEngine(BaseEngine):
             )
             return
         try:
-            num_tokens = len(self._tokenizer.encode(prompt))
+            token_ids = self._tokenizer.encode(prompt)
+            num_tokens = len(token_ids)
         except Exception as e:
             logger.warning(
                 "VLMBatchedEngine.preflight_completion: tokenizer.encode "
@@ -5425,6 +5438,7 @@ class VLMBatchedEngine(BaseEngine):
             scheduler,
             num_prompt_tokens=num_tokens,
             request_id=request_id,
+            prompt_token_ids=token_ids,
         )
 
     async def stream_chat(
