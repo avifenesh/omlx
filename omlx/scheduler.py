@@ -2000,6 +2000,11 @@ def _mimo_fused_full_attention() -> bool:
         return False
 
 
+# Keep a session lane only while active memory stays below this share of the
+# memory ceiling.
+_SESSION_LANE_MAX_ACTIVE = 0.85
+
+
 @dataclass
 class SchedulerConfig:
     """Configuration for the scheduler."""
@@ -11577,6 +11582,16 @@ class Scheduler:
 
         self._drop_session_lane()
         if not getattr(self.config, "session_lane", False):
+            return
+        # A lane that keeps the footprint near the soft watermark pauses the
+        # next admission until the pool drains, and the headroom reclaim then
+        # drops it anyway: keep it only with room to spare.
+        ceiling = int(
+            getattr(self, "_memory_dynamic_ceiling_bytes", 0)
+            or getattr(self, "_memory_static_ceiling_bytes", 0)
+            or 0
+        )
+        if ceiling > 0 and mx.get_active_memory() > _SESSION_LANE_MAX_ACTIVE * ceiling:
             return
         if not isinstance(raw_cache, (list, tuple)):
             return
