@@ -1086,6 +1086,37 @@ class PagedCacheManager(CacheManager):
     # Legacy hash methods (for backwards compatibility)
     # =========================================================================
 
+    def count_cached_prefix_tokens(self, token_ids: List[int]) -> int:
+        """Tokens a prefix lookup of ``token_ids`` would hit, without side effects.
+
+        Walks the same block-hash chain as ``get_computed_blocks`` (memory
+        index, then the SSD index) but neither counts stats nor registers
+        SSD blocks, so admission checks can ask before a request exists.
+        Text-only: the hash carries no extra keys.
+        """
+        if not self.enable_caching:
+            return 0
+        ssd = self._paged_ssd_cache_manager
+        with self._lock:
+            parent_hash = None
+            num_cached_tokens = 0
+            for i in range(len(token_ids) // self.block_size):
+                start = i * self.block_size
+                end = start + self.block_size
+                block_hash = compute_block_hash(
+                    parent_hash,
+                    token_ids[start:end],
+                    extra_keys=resolve_block_extra_keys(end),
+                    model_name=self.model_name,
+                )
+                if self.cached_block_hash_to_block.get_block(block_hash) is None and (
+                    ssd is None or not ssd.has_block(block_hash)
+                ):
+                    break
+                parent_hash = block_hash
+                num_cached_tokens += self.block_size
+            return num_cached_tokens
+
     def find_cached_block(
         self,
         tokens: List[int],
