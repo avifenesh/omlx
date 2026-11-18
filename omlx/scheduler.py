@@ -8882,8 +8882,9 @@ class Scheduler:
                 else {}
             ),
         )
-        if _INCREMENTAL_STORE:
-            self._maybe_incremental_store(request, prompt_cache, total_tokens)
+        store = getattr(self, "_maybe_incremental_store", None)
+        if _INCREMENTAL_STORE and callable(store):
+            store(request, prompt_cache, total_tokens)
 
 
     def _resolve_generation_prompt_start(self, request: "Request") -> None:
