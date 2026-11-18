@@ -1023,7 +1023,7 @@ def _regular_rotating_kv_filter_singleton(self, batch_indices):
 
 # EXPERIMENT: store completed prefix-cache blocks while a prefill runs, so the
 # finish store only adds the tail (OMLX_INCREMENTAL_STORE=1).
-_INCREMENTAL_STORE = __import__("os").environ.get("OMLX_INCREMENTAL_STORE", "0") == "1"
+_INCREMENTAL_STORE = __import__("os").environ.get("OMLX_INCREMENTAL_STORE", "1") == "1"
 _INCREMENTAL_STORE_BLOCKS = max(
     1, int(__import__("os").environ.get("OMLX_INCREMENTAL_STORE_BLOCKS", "4"))
 )
