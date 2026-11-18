@@ -738,3 +738,37 @@ def test_attention_blocks_wide_dim_split(monkeypatch):
     assert blocks(32_000, 4, 256, 8) == 42
     # Never more blocks than 64-token tiles.
     assert blocks(1_000, 4, 256, 8) == (1_000 + 63) // 64
+
+
+@pytest.mark.parametrize("dim,rows", [(256, 25), (256, 39), (128, 30), (128, 48)])
+@pytest.mark.parametrize("cache_class", [Affine4KVCache, Affine8KVCache])
+@pytest.mark.parametrize("with_sinks", [False, True])
+def test_causal_rows_over_24_run_in_one_native_call(
+    monkeypatch, dim, rows, cache_class, with_sinks
+):
+    """Causal blocks up to the native limit take one native call (16-row
+    chunks) instead of dequantizing K/V for fused SDPA."""
+    require_tensor_ops()
+    heads, repeats, tokens = 2, 3, 1500
+    cache = cache_class()
+    cache.update_and_fetch(
+        random((1, heads, tokens, dim), mx.bfloat16),
+        random((1, heads, tokens, dim), mx.bfloat16, 1),
+    )
+    q = random((1, heads * repeats, rows, dim), mx.bfloat16, 2)
+    sinks = mx.linspace(4, 9, heads * repeats) if with_sinks else None
+    calls = []
+    native = affine4._native_attention
+
+    def counting(*args, **kwargs):
+        out = native(*args, **kwargs)
+        calls.append(out is not None)
+        return out
+
+    monkeypatch.setattr(affine4, "_native_attention", counting)
+    output = cache.attention(q, scale=dim**-0.5, mask="causal", sinks=sinks)
+    assert calls == [True]
+    expected = dense(cache, q, mask="causal", sinks=sinks)
+    assert mx.allclose(
+        output.astype(mx.float32), expected.astype(mx.float32), atol=2e-2, rtol=2e-2
+    ).item()
