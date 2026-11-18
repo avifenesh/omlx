@@ -17,6 +17,7 @@ import gc
 import importlib
 import inspect
 import logging
+import os
 import threading
 import time
 from array import array
@@ -555,6 +556,11 @@ except ImportError:
     HAS_OUTPUT_PARSER = False
 
 logger = logging.getLogger(__name__)
+
+# Session lane rule: OMLX_LANE_RESIDENT=1 counts the kept caches once (they are
+# part of active memory) and leaves room for a new question's tail.
+_LANE_RESIDENT_RULE = os.environ.get("OMLX_LANE_RESIDENT", "1") == "1"
+_LANE_TAIL_HEADROOM_BYTES = 1 << 30
 
 
 _MLX_ACTIVE_MEMORY_SAMPLE_STALE_S = 2.0
@@ -11152,7 +11158,23 @@ class Scheduler:
                 for part in (state if isinstance(state, tuple) else (state,))
                 if hasattr(part, "nbytes")
             )
-            if mx.get_active_memory() + lane_bytes > limit:
+            active = mx.get_active_memory()
+            # The kept caches are the finished request's live caches, so the
+            # active memory already holds them. With the preflight charging
+            # only the uncached part of the next prompt, the lane fits when
+            # active memory plus a tail's headroom stays under the line.
+            if _LANE_RESIDENT_RULE:
+                over = active + _LANE_TAIL_HEADROOM_BYTES > limit
+            else:
+                over = active + lane_bytes > limit
+            logger.info(
+                "session lane %s: active %.1f GB, lane %.1f GB, line %.1f GB",
+                "dropped" if over else "kept",
+                active / 2**30,
+                lane_bytes / 2**30,
+                limit / 2**30,
+            )
+            if over:
                 return
         self._session_lane = (list(prompt), layers)
 
