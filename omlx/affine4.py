@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import struct
 import subprocess
 from functools import cache, lru_cache
@@ -101,6 +102,71 @@ def _q8q_prefill_attention(cache, queries, keys_state, values_state, scale):
     output = mx.array(output)
     mx.eval(output)
     return output
+
+
+# Speculative verify attention (a few causal rows over a long affine8 history)
+# on the tensor ops. OMLX_ATTN_Q8V=0 turns it off.
+_Q8V_ATTENTION = os.environ.get("OMLX_ATTN_Q8V", "1") == "1"
+_Q8V_MIN_KEYS = 16384
+# Past 8 rows a second tile runs; it pays off from about 32K keys.
+_Q8V_TWO_TILE_MIN_KEYS = 32768
+_Q8V_MAX_ROWS = 16
+_Q8V_LOGGED = False
+
+
+def _q8q_verify_attention(cache, queries, keys_state, values_state, scale, mask):
+    """2-16 causal rows at the end of the history, head dim 256, batch 1, both
+    sides affine8, read in place; None otherwise. See omlx/utils/q8q_verify.py."""
+    ks = getattr(keys_state, "_state", keys_state)
+    vs = getattr(values_state, "_state", values_state)
+    if not (isinstance(ks, TurboQuantMSEState) and isinstance(vs, TurboQuantMSEState)):
+        return None
+    if queries.ndim != 4 or ks.indices.ndim != 4 or ks.norms.ndim != 3:
+        return None
+    batch, heads, rows, dim = queries.shape
+    tokens = int(ks.indices.shape[-2])
+    kv_heads = int(ks.indices.shape[1])
+    if (
+        batch != 1
+        or dim != 256
+        or not 2 <= rows <= _Q8V_MAX_ROWS
+        or tokens < max(_Q8V_MIN_KEYS, rows)
+        or (rows > 8 and tokens < _Q8V_TWO_TILE_MIN_KEYS)
+        # The tiles take bf16 queries; fp16 models keep the current route.
+        or queries.dtype != mx.bfloat16
+        or not isinstance(cache.key_codec, Affine8Codec)
+        or not isinstance(cache.value_codec, Affine8Codec)
+        or cache.key_codec.dim != 256
+        or cache.value_codec.dim != 256
+        or kv_heads <= 0
+        or heads % kv_heads
+        or (heads // kv_heads) * min(rows, 8) > 48
+        or vs.indices.shape != ks.indices.shape
+        or tuple(vs.norms.shape) != tuple(ks.norms.shape)
+        or tuple(ks.norms.shape) != tuple(ks.indices.shape[:3])
+        or int(ks.indices.shape[-1]) != 64
+        or ks.indices.dtype != mx.uint32
+        or vs.indices.dtype != mx.uint32
+        or ks.norms.dtype not in (mx.float16, mx.float32)
+        or vs.norms.dtype != ks.norms.dtype
+        or mx.default_device() != mx.gpu
+        or not _tensor_ops_available()
+    ):
+        return None
+    # Left padding or ragged row ends turn the mask into an array: not this route.
+    if not (isinstance(mask, str) and mask == "causal"):
+        return None
+    if cache._attention_mask(mask, rows, tokens) != "causal":
+        return None
+    from .utils import q8q_verify as _q8v
+
+    rotated_queries = cache.key_codec.prepare_queries(queries).astype(mx.bfloat16)
+    rotated_output = _q8v.run(rotated_queries, ks, vs, scale)
+    global _Q8V_LOGGED
+    if not _Q8V_LOGGED:
+        _Q8V_LOGGED = True
+        logger.info("q8q verify attention in use (%d rows, %d keys)", rows, tokens)
+    return cache.value_codec._rotate_inverse(rotated_output).astype(queries.dtype)
 
 
 @cache
@@ -2005,6 +2071,12 @@ class Affine4KVCache(TurboQuantKVCache):
             )
         if self.key_codec is None or self.value_codec is None:
             self.rebuild_codecs(keys_state, values_state)
+        if _Q8V_ATTENTION and sinks is None:
+            output = _q8q_verify_attention(
+                self, queries, keys_state, values_state, scale, mask
+            )
+            if output is not None:
+                return output
         output = _native_attention(
             self, queries, keys_state, values_state, scale, mask, sinks
         )
