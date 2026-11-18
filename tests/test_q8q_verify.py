@@ -110,3 +110,23 @@ def test_verify_splits_and_a_tight_buffer(monkeypatch, split, rows):
         diff = mx.abs(out - ref.astype(mx.float32))
         assert mx.max(diff).item() < 0.01 * mx.max(mx.abs(ref)).item() + 1e-3
         assert mx.mean(diff).item() < 1e-3
+
+
+@pytest.mark.parametrize("rows", [17, 30, 40])
+def test_tail_rows_match_the_existing_route(monkeypatch, rows):
+    """A new question's tail (17-40 rows) runs as tiles of 8 past the tail threshold."""
+    require_tensor_ops()
+    monkeypatch.setattr(a4, "_Q8V_MIN_KEYS", 1024)
+    monkeypatch.setattr(a4, "_Q8V_TWO_TILE_MIN_KEYS", 1024)
+    monkeypatch.setattr(a4, "_Q8V_TAIL_MIN_KEYS", 4096)
+    cache, k, v, q = _cache(5000, rows, seed=rows)
+    assert a4._q8q_verify_attention(cache, q, k, v, 256**-0.5, "causal") is not None
+    monkeypatch.setattr(a4, "_Q8V_ATTENTION", False)
+    ref = cache.attention(q, keys_state=k, values_state=v, scale=256**-0.5, mask="causal")
+    monkeypatch.setattr(a4, "_Q8V_ATTENTION", True)
+    out = cache.attention(q, keys_state=k, values_state=v, scale=256**-0.5, mask="causal")
+    diff = mx.abs(out.astype(mx.float32) - ref.astype(mx.float32))
+    assert mx.max(diff).item() < 0.01 * mx.max(mx.abs(ref)).item() + 1e-3
+    assert mx.mean(diff).item() < 1e-3
+    monkeypatch.setattr(a4, "_Q8V_TAIL", False)
+    assert a4._q8q_verify_attention(cache, q, k, v, 256**-0.5, "causal") is None

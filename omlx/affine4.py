@@ -111,6 +111,12 @@ _Q8V_MIN_KEYS = 16384
 # Past 8 rows a second tile runs; it pays off from about 32K keys.
 _Q8V_TWO_TILE_MIN_KEYS = 32768
 _Q8V_MAX_ROWS = 16
+# A new question's tail (17-40 rows) over a long history: tiles of 8 beat the
+# native and q8q routes from 64K keys (measured 245K, 30 rows: 20.2 -> 12.3 ms
+# per layer). OMLX_ATTN_Q8V_TAIL=0 turns it off.
+_Q8V_TAIL = os.environ.get("OMLX_ATTN_Q8V_TAIL", "1") == "1"
+_Q8V_TAIL_MAX_ROWS = 40
+_Q8V_TAIL_MIN_KEYS = 65536
 _Q8V_LOGGED = False
 
 
@@ -129,7 +135,15 @@ def _q8q_verify_attention(cache, queries, keys_state, values_state, scale, mask)
     if (
         batch != 1
         or dim != 256
-        or not 2 <= rows <= _Q8V_MAX_ROWS
+        or rows < 2
+        or (
+            rows > _Q8V_MAX_ROWS
+            and not (
+                _Q8V_TAIL
+                and rows <= _Q8V_TAIL_MAX_ROWS
+                and tokens >= _Q8V_TAIL_MIN_KEYS
+            )
+        )
         or tokens < max(_Q8V_MIN_KEYS, rows)
         or (rows > 8 and tokens < _Q8V_TWO_TILE_MIN_KEYS)
         # The tiles take bf16 queries; fp16 models keep the current route.
