@@ -551,3 +551,121 @@ def test_resident_layer_with_other_codec_is_not_used(manager_factory):
     assert restored is not None and restored[0] is not other
     assert other.offset == 12
     assert restored[0].offset == 8
+
+
+def test_incremental_store_then_finish_store_adds_only_the_tail(manager_factory):
+    """Blocks stored while a prefill runs are found before it finishes, and the
+    finish store (cut by trim_store_payload) adds only the blocks after them."""
+    manager = manager_factory(types=["Affine8KVCache"])
+    manager.set_expected_layer_signature(["Affine8KVCache"], turboquant_kv_bits=8)
+    prefix, paged = _prefix(manager)
+    tokens = list(range(100, 112))
+    live = _live8(8)
+    payload = prefix.copy_payload_prefix([_data(live)], 8, 0)
+    assert payload is not None
+    assert prefix.store_cache("running", tokens[:8], payload) is not None
+    stored = list(paged.get_block_table("running").block_ids)
+    assert len(stored) == 2
+
+    table, remaining = prefix.fetch_cache("reader", tokens[:8] + [7])
+    assert table is not None and table.num_tokens == 8 and remaining == [7]
+    prefix.release_cache("reader")
+
+    live.update_and_fetch(
+        mx.random.normal((1, 2, 4, 16)).astype(mx.float16),
+        mx.random.normal((1, 2, 4, 16)).astype(mx.float16),
+    )
+    mx.eval(live.state)
+    final = [_data(live)]
+    assert prefix.trim_store_payload("running", final) == 8
+    table = prefix.store_cache("running", tokens, final)
+    assert table is not None and table.num_tokens == 12
+    assert table.block_ids[:2] == stored
+    assert len(table.block_ids) == 3
+
+
+def _incremental_scheduler(prefix, monkeypatch, live):
+    import omlx.scheduler as sch
+
+    monkeypatch.setattr(sch, "_INCREMENTAL_STORE_BLOCKS", 1)
+    submitted = []
+    sched = SimpleNamespace(
+        block_aware_cache=prefix,
+        config=SimpleNamespace(paged_cache_block_size=4),
+        _incremental_stored={},
+        _incremental_store_released=set(),
+        _boundary_cache_snapshots={},
+        _boundary_snapshot_store=None,
+        paged_ssd_cache_manager=None,
+        _PREFILL_SNAPSHOT_MARKER=sch.Scheduler._PREFILL_SNAPSHOT_MARKER,
+        _stream=None,
+        _model_has_unreconstructible_cache=lambda: False,
+        _extract_cache_states=lambda cache: ([_data(c) for c in cache], None),
+        _collect_arrays_from_extracted_cache=lambda data: [],
+    )
+    sched._incremental_store_worker = (
+        lambda *a: sch.Scheduler._incremental_store_worker(sched, *a)
+    )
+
+    def submit(fn, *args):
+        submitted.append(args)
+        fn(*args)
+
+    sched._store_cache_executor = SimpleNamespace(submit=submit)
+    return sch, sched, submitted
+
+
+def test_scheduler_incremental_store_tracks_progress_and_release(
+    manager_factory, monkeypatch
+):
+    manager = manager_factory(types=["Affine8KVCache"])
+    manager.set_expected_layer_signature(["Affine8KVCache"], turboquant_kv_bits=8)
+    prefix, paged = _prefix(manager)
+    live = _live8(8)
+    sch, sched, submitted = _incremental_scheduler(prefix, monkeypatch, live)
+    request = SimpleNamespace(
+        request_id="r",
+        prompt_token_ids=list(range(200, 216)),
+        vlm_extra_keys_for_cache=None,
+        vlm_extra_key_ranges_for_cache=None,
+    )
+    sch.Scheduler._maybe_incremental_store(sched, request, [live], 8)
+    assert len(submitted) == 1 and sched._incremental_stored["r"] == 8
+    table, _ = prefix.fetch_cache("reader", list(range(200, 208)) + [1])
+    assert table is not None and table.num_tokens == 8
+    prefix.release_cache("reader")
+    # Nothing new: no second store.
+    sch.Scheduler._maybe_incremental_store(sched, request, [live], 8)
+    assert len(submitted) == 1
+    # The next block stores from the stored prefix on.
+    live.update_and_fetch(
+        mx.random.normal((1, 2, 4, 16)).astype(mx.float16),
+        mx.random.normal((1, 2, 4, 16)).astype(mx.float16),
+    )
+    mx.eval(live.state)
+    sched._incremental_store_released.add("r")
+    sch.Scheduler._maybe_incremental_store(sched, request, [live], 12)
+    assert len(submitted) == 2
+    assert paged.get_block_table("r") is None
+    assert "r" not in sched._incremental_store_released
+    table, _ = prefix.fetch_cache("reader2", list(range(200, 212)) + [1])
+    assert table is not None and table.num_tokens == 12
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_boundary_snapshot_runs_the_incremental_store_only_when_enabled(
+    monkeypatch, enabled
+):
+    import omlx.scheduler as sch
+
+    monkeypatch.setattr(sch, "_INCREMENTAL_STORE", enabled)
+    calls = []
+    sched = SimpleNamespace(
+        config=SimpleNamespace(paged_cache_block_size=4),
+        _on_prefill_boundary_snapshot=lambda *a, **k: None,
+        _boundary_snapshot_block_size=lambda request, total: 4,
+        _maybe_incremental_store=lambda *a: calls.append(a),
+    )
+    request = SimpleNamespace(request_id="r")
+    sch.Scheduler._emit_prefill_boundary_snapshot(sched, request, [object()], 8)
+    assert len(calls) == (1 if enabled else 0)
