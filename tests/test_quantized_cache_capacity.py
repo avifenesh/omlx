@@ -190,9 +190,9 @@ def test_a_row_leaving_is_copied_out_layer_by_layer(monkeypatch, stays):
     """The rows that stay are copied at the next token one layer at a time.
 
     Each layer's old buffer goes before the next layer copies, so the peak
-    does not hold the old batch on top of the rows that stay, and each copy
-    asks for the restore's gated pool clear. The pool size itself depends on
-    allocator timing, so only the request is checked, not the bytes left.
+    does not hold the old batch on top of the rows that stay. The copy runs
+    inside the scheduler's deferred clear window after a finish (#435), so it
+    must not clear the pool itself.
     """
     import omlx.cache.prefix_cache as prefix_cache
 
@@ -232,7 +232,7 @@ def test_a_row_leaving_is_copied_out_layer_by_layer(monkeypatch, stays):
     assert extra < 0.5 * kept, f"leave peaked {extra / kept:.2f} x the kept rows"
     # The leaving row's half of the old buffer is no longer live.
     assert mx.get_active_memory() - before < -0.8 * kept
-    assert flushes == [prefix_cache._RESTORE_POOL_FLUSH_BYTES] * layers
+    assert flushes == []
     for batch, parts in zip(batches, expected):
         assert batch.left_padding.tolist() == [0]
         assert _equal(_row(_written(batch), 0, 0, tokens), parts)
