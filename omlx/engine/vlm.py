@@ -2688,6 +2688,12 @@ class VLMBatchedEngine(BaseEngine):
                 apply_flint_decode_patch()
             except Exception:
                 logger.debug("Flint decode patch not applied", exc_info=True)
+            try:
+                from ..patches.flint_moe_prefill import apply_flint_moe_prefill_patch
+
+                apply_flint_moe_prefill_patch()
+            except Exception:
+                logger.debug("Flint MoE prefill patch not applied", exc_info=True)
 
         # LFM3 text tower (shared by LFM3, -VL, -Audio and -Omni): one-launch
         # RoPE instead of about fifteen array ops per q/k call.
