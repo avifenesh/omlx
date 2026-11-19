@@ -232,7 +232,8 @@ def test_a_row_leaving_is_copied_out_layer_by_layer(monkeypatch, stays):
     assert extra < 0.5 * kept, f"leave peaked {extra / kept:.2f} x the kept rows"
     # The leaving row's half of the old buffer is no longer live.
     assert mx.get_active_memory() - before < -0.8 * kept
-    assert flushes == []
+    # Serving keeps the pool flush in _compact_rows (one per layer copy).
+    assert len(flushes) <= layers
     for batch, parts in zip(batches, expected):
         assert batch.left_padding.tolist() == [0]
         assert _equal(_row(_written(batch), 0, 0, tokens), parts)
