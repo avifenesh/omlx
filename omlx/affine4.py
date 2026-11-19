@@ -139,6 +139,10 @@ _TILE_VERIFY_MAX_ROWS = 16
 _TILE_VERIFY_TWO_TILE_MIN_KEYS = 32768
 # Query heads per KV head with tests and measured numbers on this route.
 _TILE_VERIFY_GROUPS = (6, 8)
+# Serving: a new question's 17-40 tail rows over a long history also run as
+# verify tiles (they beat the native and prefill routes from 64K keys).
+_TILE_TAIL_MAX_ROWS = 40
+_TILE_TAIL_MIN_KEYS = 65536
 
 
 @lru_cache(maxsize=1)
@@ -169,7 +173,11 @@ def _tile_verify_attention(cache, queries, keys_state, values_state, scale, mask
     tiles = -(-rows // per_tile)
     if (
         group not in _TILE_VERIFY_GROUPS
-        or not 2 <= rows <= _TILE_VERIFY_MAX_ROWS
+        or rows < 2
+        or (
+            rows > _TILE_VERIFY_MAX_ROWS
+            and not (rows <= _TILE_TAIL_MAX_ROWS and tokens >= _TILE_TAIL_MIN_KEYS)
+        )
         or tokens < _TILE_MIN_KEYS
         or (tiles > 1 and tokens < _TILE_VERIFY_TWO_TILE_MIN_KEYS)
     ):

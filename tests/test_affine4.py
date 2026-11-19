@@ -853,6 +853,25 @@ def test_tile_verify_matches_native_attention(monkeypatch, heads, kv_heads, rows
     _assert_close(out, ref)
 
 
+@pytest.mark.parametrize("rows", [24, 39])
+def test_tile_verify_takes_a_long_tail(monkeypatch, rows):
+    """A new question's 17-40 tail rows over a long history run as verify tiles."""
+    require_tensor_ops()
+    monkeypatch.setattr(affine4, "_TILE_MIN_KEYS", 1024)
+    monkeypatch.setattr(affine4, "_TILE_VERIFY_TWO_TILE_MIN_KEYS", 1024)
+    monkeypatch.setattr(affine4, "_TILE_TAIL_MIN_KEYS", 1024)
+    monkeypatch.setattr(affine4, "_TILE_LAUNCHABLE", {})
+    monkeypatch.setattr(affine4, "_tile_attention_available", lambda: True)
+    cache, k, v, q = _verify_case(5000, rows, 24, 4, seed=rows)
+    ks, vs = cache._unwrap(k), cache._unwrap(v)
+    ref = affine4._native_attention(cache, q, ks, vs, 256**-0.5, "causal")
+    if ref is None:
+        pytest.skip("native attention does not take this shape")
+    out = affine4._tile_verify_attention(cache, q, ks, vs, 256**-0.5, "causal")
+    assert out is not None
+    _assert_close(out, ref)
+
+
 @pytest.mark.parametrize("split", [3, 128])
 def test_tile_verify_splits_and_exact_size_states(monkeypatch, split):
     """Uneven and empty splits (more splits than pages), over the cache views and
