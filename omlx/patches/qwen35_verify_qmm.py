@@ -83,6 +83,7 @@ from omlx.custom_kernels.nax import is_nax_available
 from . import m1_verify_mma, m1_verify_qmv
 
 logger = logging.getLogger(__name__)
+_ROUTE_FAIL_LOGGED = False
 
 _KERNEL_CACHE: dict = {}
 _ROUTE_ARMED = threading.local()
@@ -1679,7 +1680,14 @@ def apply_verify_qmm_patch() -> bool:
                 y = y + self.bias
             return y.reshape(batch, length, N)
         except Exception:
-            logger.debug("verify qmm route failed; stock fallback", exc_info=True)
+            global _ROUTE_FAIL_LOGGED
+            if not _ROUTE_FAIL_LOGGED:
+                _ROUTE_FAIL_LOGGED = True
+                logger.warning(
+                    "verify qmm route failed (shape %s); stock fallback",
+                    tuple(x.shape),
+                    exc_info=True,
+                )
             return orig_call(self, x)
 
     cls.__call__ = patched_call
