@@ -23,6 +23,7 @@ def _block(experts=32, bits=6):
     mx.random.seed(3)
     block = flint.SparseMoeBlock(args)
     block.expert_bias = mx.random.normal((experts,)) * 0.1
+    block.set_dtype(mx.bfloat16)
     nn.quantize(block, group_size=64, bits=bits)
     mx.eval(block.parameters())
     return block
@@ -30,7 +31,7 @@ def _block(experts=32, bits=6):
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="needs Metal")
 @pytest.mark.parametrize("rows", [1024, 2052])
-def test_prefill_matches_the_stock_body(rows):
+def test_prefill_matches_the_stock_body(rows, caplog):
     block = _block()
     x = (mx.random.normal((1, rows, 2048)) * 0.5).astype(mx.bfloat16)
     cls = flint.SparseMoeBlock
@@ -38,7 +39,9 @@ def test_prefill_matches_the_stock_body(rows):
     ref = orig(block, x).astype(mx.float32)
     if not flint_moe_prefill.apply_flint_moe_prefill_patch():
         pytest.skip("moe_weighted_sum kernel unavailable")
-    out = block(x).astype(mx.float32)
+    with caplog.at_level("WARNING", logger="omlx.patches.flint_moe_prefill"):
+        out = block(x).astype(mx.float32)
+    assert "fast path failed" not in caplog.text
     assert out.shape == ref.shape == (1, rows, 2048)
     diff = mx.abs(out - ref)
     assert mx.max(diff).item() <= 0.02 * mx.max(mx.abs(ref)).item() + 1e-2
