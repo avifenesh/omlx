@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import math
+import os
 import weakref
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -827,12 +828,25 @@ class Inkling2Attention(nn.Module):
 
     def attend(self, q, k, v, rel, sink, kv, state=None):
         left_padding = None
+        value_codec = None
         if kv is not None:
             k, v = kv.update_and_fetch(k, v)
             left_padding = getattr(kv, "left_padding", None)
+            if not isinstance(k, mx.array):
+                # A packed affine cache (OMLX_INKLING_KV8) returns rotated codes
+                # with one scale per vector. Attention runs in the rotated space:
+                # the query takes the key rotation (orthonormal, so scores do not
+                # change), keys and values are codes * scale, and the output takes
+                # the value rotation back. The bias band and sinks do not depend
+                # on key or value contents.
+                dtype = q.dtype
+                q = kv.key_codec.prepare_queries(q).astype(dtype)
+                k = kv.key_codec.dequantize_rotated(k, dtype)
+                v = kv.value_codec.dequantize_rotated(v, dtype)
+                value_codec = kv.value_codec
         elif state is not None:
             k, v, left_padding = windows.append(state, k, v)
-        return kernels.banded_sink_attention(
+        out = kernels.banded_sink_attention(
             q,
             k,
             v,
@@ -842,6 +856,9 @@ class Inkling2Attention(nn.Module):
             window=self.window,
             left_padding=left_padding,
         )
+        if value_codec is not None:
+            out = value_codec._rotate_inverse(out).astype(q.dtype)
+        return out
 
     def output(self, out, gate):
         b, _, length, _ = out.shape
@@ -1260,9 +1277,10 @@ class Inkling2TextModel(nn.Module):
 
 
 class Model(nn.Module):
-    # ``attend`` reads the keys and values a cache returns as dense arrays; a
-    # packed (TurboQuant or affine) cache hands back codes it cannot use.
-    dense_kv_attention = True
+    # ``attend`` reads dense keys and values, or (OMLX_INKLING_KV8=1) the
+    # rotated codes of an affine cache, which it turns back into rotated dense
+    # rows for the same kernels. Without the flag the cache stays dense.
+    dense_kv_attention = os.environ.get("OMLX_INKLING_KV8", "0") != "1"
     # Verify windows up to the compiled width keep the compiled forward, and
     # mtp_partial_rollback recuts the conv tails for any rejected count.
     _omlx_mtp_max_verify_rows = _COMPILED_MAX_TOKENS
