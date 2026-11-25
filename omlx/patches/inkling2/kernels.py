@@ -1947,10 +1947,7 @@ def banded_sink_attention(
             for r in range(length)
         ]
         return mx.concatenate(rows, axis=1).transpose(0, 2, 1, 3)
-    if q.dtype in (mx.bfloat16, mx.float16) and (
-        _use_flash(length, window) or (fp8 and length >= _FLASH_MIN_QUERIES)
-    ):
-        # FP8 K/V never take MLX's SDPA, which would need them dense.
+    if q.dtype in (mx.bfloat16, mx.float16) and _use_flash(length, window):
         return flash_banded_attention(
             q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding
         )
