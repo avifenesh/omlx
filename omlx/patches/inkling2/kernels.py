@@ -1439,10 +1439,42 @@ def _q8_part_source() -> str:
     const device uint* vb_ptr = v + b * v_strides[0] + hk * v_strides[1];
     const device SC* ksb = ks + b * ks_strides[0] + hk * ks_strides[1];
     const device SC* vsb = vs + b * vs_strides[0] + hk * vs_strides[1];
+    // Vector loads need contiguous 16-byte aligned code rows.
+    const bool vec_q8 = k_strides[3] == 1 && v_strides[3] == 1
+        && (k_strides[2] & 3) == 0 && (v_strides[2] & 3) == 0
+        && (uintptr_t(kb_ptr) & 15) == 0 && (uintptr_t(vb_ptr) & 15) == 0;
+    #define KEY_OF(d0_, r_) (a - (d0_) - (r_))
 
     // Slot r of a tile is the key at distance d0 + r.
     for (int d0 = d_begin; d0 < d_end; d0 += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (vec_q8) {
+            // 16 codes per 16-byte load; one scale read per key and slot.
+            for (int c = tid; c < BK * (D / 16); c += NT) {
+                const int r = c / (D / 16);
+                const int w4 = c % (D / 16);
+                uint4 kw = uint4(0u);
+                uint4 vw = uint4(0u);
+                float ksc = 0.0f;
+                float vsc = 0.0f;
+                if (d0 + r < d_end) {
+                    const int key = KEY_OF(d0, r);
+                    kw = *(const device uint4*)(kb_ptr + key * k_strides[2] + w4 * 4);
+                    vw = *(const device uint4*)(vb_ptr + key * v_strides[2] + w4 * 4);
+                    ksc = float(ksb[key * ks_strides[2]]);
+                    vsc = float(vsb[key * vs_strides[2]]);
+                }
+                for (int i = 0; i < 4; ++i) {
+                    for (int j = 0; j < 4; ++j) {
+                        const int col = w4 * 16 + i * 4 + j;
+                        const float kc = float(int(((kw[i] >> (8 * j)) & 0xFFu) ^ 0x80u) - 128);
+                        const float vc = float(int(((vw[i] >> (8 * j)) & 0xFFu) ^ 0x80u) - 128);
+                        Ks[col * LDK + r] = half(kc * ksc);
+                        Vs[r * LDV + col] = half(vc * vsc);
+                    }
+                }
+            }
+        } else
         for (int c = tid; c < BK * (D / 4); c += NT) {
             const int r = c / (D / 4);
             const int w = c % (D / 4);
@@ -1512,6 +1544,10 @@ def _q8_rows_part_source() -> str:
         (
             "                const int key = a - d0 - r;\n",
             "                const int key = (S - 1) - d0 - r;\n",
+        ),
+        (
+            "    #define KEY_OF(d0_, r_) (a - (d0_) - (r_))\n",
+            "    #define KEY_OF(d0_, r_) ((S - 1) - (d0_) - (r_))\n",
         ),
         (
             "        if (int(sg) * 8 >= G) {\n",
