@@ -1378,10 +1378,23 @@ def gqa_flash_decode_attention(q, k, v, rel, sink, *, scale, window, left_paddin
             ),
         )
     part, fold = _decode_kernels
-    reach = min(s, window) if window else s
+    # Verify blocks share each staged tile across their positions.
+    shared = length > 1 and _Q8_SHARED_TILES and length * g <= 8 * _Q8_MAX_ROW_GROUPS
+    if shared:
+        global _decode_rows_part
+        if _decode_rows_part is None:
+            _decode_rows_part = mx.fast.metal_kernel(
+                name="omlx_inkling2_flash_verify_part",
+                input_names=["q", "k", "v", "rel", "dims", "scale"],
+                output_names=["part_o", "part_m", "part_l"],
+                source=_rows_part_source(_DECODE_PART_SOURCE),
+                ensure_row_contiguous=False,
+            )
+        part = _decode_rows_part
+    reach = min(s, window + (length - 1 if shared else 0)) if window else s
     chunk = _DECODE_SLIDING_CHUNK if window else _DECODE_CHUNK
     ns = max(1, -(-reach // chunk))
-    nsg = max(-(-g // 8), _DECODE_STAGERS)
+    nsg = max(-(-(length * g if shared else g) // 8), _DECODE_STAGERS)
     dims = mx.array([length, s, ns] + [0] * b, dtype=mx.int32)
     if left_padding is not None:
         dims = mx.concatenate([dims[:3], left_padding.astype(mx.int32)])
@@ -1405,7 +1418,7 @@ def gqa_flash_decode_attention(q, k, v, rel, sink, *, scale, window, left_paddin
             ("CHUNK", chunk),
             ("NSG", nsg),
         ],
-        grid=(ns * nsg * 32, hkv * length, b),
+        grid=(ns * nsg * 32, hkv * (1 if shared else length), b),
         threadgroup=(nsg * 32, 1, 1),
         output_shapes=[
             (b, hq, length, ns, d),
@@ -1510,7 +1523,18 @@ _decode_q8_part = None
 # a row (position, head) at position p is L - 1 - p keys behind it, so its own
 # distance, causal end, bias band and window are shifted per row.
 def _q8_rows_part_source() -> str:
-    src = _q8_part_source()
+    return _rows_part_source(_q8_part_source())
+
+
+def _rows_part_source(src: str) -> str:
+    """The shared-tile verify variant of a decode part kernel source."""
+    src = src.replace(
+        "                    const int key = a - d0 - r;\n",
+        "                    const int key = (S - 1) - d0 - r;\n",
+    ).replace(
+        "    #define KEY_OF(d0_, r_) (a - (d0_) - (r_))\n",
+        "    #define KEY_OF(d0_, r_) ((S - 1) - (d0_) - (r_))\n",
+    )
     edits = [
         (
             "    const int pos = gy % L;\n    const int hk = gy / L;\n",
@@ -1541,14 +1565,7 @@ def _q8_rows_part_source() -> str:
             "        nk = min(nk, WINDOW + L - 1);\n"
             "    }\n",
         ),
-        (
-            "                const int key = a - d0 - r;\n",
-            "                const int key = (S - 1) - d0 - r;\n",
-        ),
-        (
-            "    #define KEY_OF(d0_, r_) (a - (d0_) - (r_))\n",
-            "    #define KEY_OF(d0_, r_) ((S - 1) - (d0_) - (r_))\n",
-        ),
+
         (
             "        if (int(sg) * 8 >= G) {\n",
             "        if (int(sg) * 8 >= L * G) {\n",
@@ -1590,14 +1607,19 @@ def _q8_rows_part_source() -> str:
             "        const float factor = first ? 0.0f : precise::exp2(m - m_new);\n",
         ),
     ]
+    # Keys are staged by distance from the block's newest key in every load path.
+    src = src.replace("const int key = a - d0 - r;", "const int key = (S - 1) - d0 - r;")
     for old, new in edits:
         if src.count(old) != 1:
-            raise RuntimeError(f"q8 verify kernel: anchor not found once: {old[:60]!r}")
+            raise RuntimeError(f"verify kernel: anchor not found once: {old[:60]!r}")
         src = src.replace(old, new)
+    if " a - d0 - r" in src or "(a - (d0_)" in src:
+        raise RuntimeError("verify kernel: a per-position key index is left")
     return src
 
 
 _decode_q8_rows_part = None
+_decode_rows_part = None
 # Off: OMLX_INKLING_Q8_SHARED=0 (verify blocks re-stage tiles per position).
 _Q8_SHARED_TILES = os.environ.get("OMLX_INKLING_Q8_SHARED", "1") != "0"
 # Simdgroups of 8 (position, head) rows per threadgroup (1024 threads max).
@@ -1796,7 +1818,7 @@ def banded_sink_attention(
     """
     b, length = q.shape[0], q.shape[2]
     if (
-        (b > 1 or left_padding is not None)
+        (b > 1 or left_padding is not None or (length > 1 and _Q8_SHARED_TILES and not is_row_exact_armed()))
         and length < _FLASH_MIN_QUERIES
         and _use_flash_decode(q, k)
     ):

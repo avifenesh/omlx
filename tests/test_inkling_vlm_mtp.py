@@ -1774,11 +1774,14 @@ def test_inkling2_flash_decode_rows_have_the_bits_of_one_row_calls(
     window, dtype, monkeypatch
 ):
     """Each row of a left-padded batch of verify blocks is the decode step of
-    its token: one query over that row's own keys, alone."""
+    its token: one query over that row's own keys, alone. That holds for the
+    per-position kernel (OMLX_INKLING_Q8_SHARED=0); the default shared-tile
+    verify kernel groups keys differently per row and is not bit-exact."""
     from omlx.patches.inkling2 import kernels
 
     if mx.default_device() != mx.gpu:
         pytest.skip("Metal kernel")
+    monkeypatch.setattr(kernels, "_Q8_SHARED_TILES", False)
     _small_decode_chunks(monkeypatch, kernels)
     length, keys, pads = 8, 300, [0, 113]
     q, k, v, rel, sink = _decode_attention_case(
