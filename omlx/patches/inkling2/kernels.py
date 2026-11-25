@@ -1423,6 +1423,151 @@ def gqa_flash_decode_attention(q, k, v, rel, sink, *, scale, window, left_paddin
     )[0]
 
 
+# The decode kernel over an 8-bit affine cache (OMLX_INKLING_KV8): the same
+# kernel with K and V staged from int8 codes (four per uint32, low byte first,
+# sign-extended) times one scale per vector, instead of a BF16 copy of the
+# whole cache. Everything after the staging is unchanged.
+def _q8_part_source() -> str:
+    src = _DECODE_PART_SOURCE
+    head = src.index("    const device T* kb_ptr")
+    tail = src.index(
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        if (int(sg) * 8 >= G) {"
+    )
+    staging = """    const device uint* kb_ptr = k + b * k_strides[0] + hk * k_strides[1];
+    const device uint* vb_ptr = v + b * v_strides[0] + hk * v_strides[1];
+    const device SC* ksb = ks + b * ks_strides[0] + hk * ks_strides[1];
+    const device SC* vsb = vs + b * vs_strides[0] + hk * vs_strides[1];
+
+    // Slot r of a tile is the key at distance d0 + r.
+    for (int d0 = d_begin; d0 < d_end; d0 += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int c = tid; c < BK * (D / 4); c += NT) {
+            const int r = c / (D / 4);
+            const int w = c % (D / 4);
+            uint kw = 0u;
+            uint vw = 0u;
+            float ksc = 0.0f;
+            float vsc = 0.0f;
+            if (d0 + r < d_end) {
+                const int key = a - d0 - r;
+                kw = kb_ptr[key * k_strides[2] + w * k_strides[3]];
+                vw = vb_ptr[key * v_strides[2] + w * v_strides[3]];
+                ksc = float(ksb[key * ks_strides[2]]);
+                vsc = float(vsb[key * vs_strides[2]]);
+            }
+            for (int j = 0; j < 4; ++j) {
+                const int col = w * 4 + j;
+                const float kc = float(int(((kw >> (8 * j)) & 0xFFu) ^ 0x80u) - 128);
+                const float vc = float(int(((vw >> (8 * j)) & 0xFFu) ^ 0x80u) - 128);
+                Ks[col * LDK + r] = half(kc * ksc);
+                Vs[r * LDV + col] = half(vc * vsc);
+            }
+        }
+"""
+    return src[:head] + staging + src[tail:]
+
+
+_decode_q8_part = None
+
+
+def q8_decode_supported(q, k_state, kv) -> bool:
+    """Decode-sized blocks over an 8-bit affine cache the q8 kernel can read."""
+    indices = getattr(k_state, "indices", None)
+    norms = getattr(k_state, "norms", None)
+    return (
+        getattr(getattr(kv, "key_codec", None), "bits", None) == 8
+        and getattr(getattr(kv, "value_codec", None), "bits", None) == 8
+        and indices is not None
+        and indices.dtype == mx.uint32
+        and norms is not None
+        and norms.ndim == 3
+        and q.shape[2] < _FLASH_MIN_QUERIES
+        and q.shape[-1] % 8 == 0
+        and q.shape[-1] == indices.shape[-1] * 4
+        and q.dtype in (mx.bfloat16, mx.float16)
+        and mx.default_device() == mx.gpu
+        and 80 * q.shape[-1] + 256 <= 32768
+        and q.shape[1] % indices.shape[1] == 0
+        and getattr(kv, "_row_ends", None) is None
+    )
+
+
+def gqa_flash_decode_attention_q8(
+    q, k_state, v_state, rel, sink, *, scale, window, left_padding=None
+):
+    """``gqa_flash_decode_attention`` reading an 8-bit affine cache in place.
+
+    ``q`` is already in the key rotation; ``k_state``/``v_state`` hold
+    ``indices`` [B, Hkv, S, D/4] uint32 and ``norms`` [B, Hkv, S] scales; the
+    output is in the value rotation. S is the cached length the caller passes
+    through the state's ``shape``.
+    """
+    global _decode_q8_part, _decode_kernels
+    b, hq, length, d = q.shape
+    k_idx, v_idx = k_state.indices, v_state.indices
+    k_sc, v_sc = k_state.norms, v_state.norms
+    hkv = k_idx.shape[1]
+    s = int(k_state.shape[2])
+    g = hq // hkv
+    if _decode_q8_part is None:
+        _decode_q8_part = mx.fast.metal_kernel(
+            name="omlx_inkling2_flash_decode_part_q8",
+            input_names=["q", "k", "v", "ks", "vs", "rel", "dims", "scale"],
+            output_names=["part_o", "part_m", "part_l"],
+            source=_q8_part_source(),
+            ensure_row_contiguous=False,
+        )
+    if _decode_kernels is None:
+        # Builds the shared fold kernel.
+        gqa_flash_decode_attention(
+            q[:1, :, :1], mx.zeros((1, hkv, 1, d), q.dtype), mx.zeros((1, hkv, 1, d), q.dtype),
+            rel[:1, :1], sink[:1, :1], scale=scale, window=window,
+        )
+    fold = _decode_kernels[1]
+    reach = min(s, window) if window else s
+    chunk = _DECODE_SLIDING_CHUNK if window else _DECODE_CHUNK
+    ns = max(1, -(-reach // chunk))
+    nsg = max(-(-g // 8), _DECODE_STAGERS)
+    dims = mx.array([length, s, ns] + [0] * b, dtype=mx.int32)
+    if left_padding is not None:
+        dims = mx.concatenate([dims[:3], left_padding.astype(mx.int32)])
+    part_o, part_m, part_l = _decode_q8_part(
+        inputs=[
+            q, k_idx, v_idx, k_sc, v_sc, mx.contiguous(rel), dims,
+            mx.array([scale], dtype=mx.float32),
+        ],
+        template=[
+            ("T", q.dtype),
+            ("SC", k_sc.dtype),
+            ("IS_BF16", q.dtype == mx.bfloat16),
+            ("D", d),
+            ("HQ", hq),
+            ("G", g),
+            ("R", rel.shape[-1]),
+            ("WINDOW", int(window)),
+            ("CHUNK", chunk),
+            ("NSG", nsg),
+        ],
+        grid=(ns * nsg * 32, hkv * length, b),
+        threadgroup=(nsg * 32, 1, 1),
+        output_shapes=[
+            (b, hq, length, ns, d),
+            (b, hq, length, ns),
+            (b, hq, length, ns),
+        ],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+    )
+    return fold(
+        inputs=[part_o, part_m, part_l, sink, mx.array([length, ns], dtype=mx.int32)],
+        template=[("T", q.dtype), ("D", d), ("HQ", hq)],
+        grid=(b * hq * length * 32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(b, hq, length, d)],
+        output_dtypes=[q.dtype],
+    )[0]
+
+
 def _use_flash(length: int, window: int) -> bool:
     """Prefill blocks take the flash kernel on the GPU.
 

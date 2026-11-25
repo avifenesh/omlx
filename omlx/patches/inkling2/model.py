@@ -36,6 +36,10 @@ from ..moe_verify_gather import pair_order
 from ..qwen35_verify_qmm import is_row_exact_armed
 from . import cache as windows
 from . import kernels, loopcd, verify_experts
+
+# 8-bit KV decode and verify blocks attend over the codes in place (no BF16
+# copy of the cache). Off: OMLX_INKLING_Q8_ATTN=0.
+_Q8_DECODE = os.environ.get("OMLX_INKLING_Q8_ATTN", "1") != "0"
 from .loader import sanitize_weights
 from .vision import VisionArgs, VisionTower
 
@@ -841,6 +845,13 @@ class Inkling2Attention(nn.Module):
                 # on key or value contents.
                 dtype = q.dtype
                 q = kv.key_codec.prepare_queries(q).astype(dtype)
+                if _Q8_DECODE and kernels.q8_decode_supported(q, k, kv):
+                    # Decode and verify blocks read the codes in place.
+                    out = kernels.gqa_flash_decode_attention_q8(
+                        q, k, v, rel, sink, scale=self.scale, window=self.window,
+                        left_padding=left_padding,
+                    )
+                    return kv.value_codec._rotate_inverse(out).astype(dtype)
                 k = kv.key_codec.dequantize_rotated(k, dtype)
                 v = kv.value_codec.dequantize_rotated(v, dtype)
                 value_codec = kv.value_codec
