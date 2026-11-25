@@ -1818,7 +1818,7 @@ def banded_sink_attention(
     """
     b, length = q.shape[0], q.shape[2]
     if (
-        (b > 1 or left_padding is not None or (length > 1 and _Q8_SHARED_TILES and not is_row_exact_armed()))
+        (b > 1 or left_padding is not None or (1 < length <= 8 and _Q8_SHARED_TILES and not is_row_exact_armed()))
         and length < _FLASH_MIN_QUERIES
         and _use_flash_decode(q, k)
     ):
