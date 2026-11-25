@@ -72,3 +72,43 @@ def test_flag_controls_dense_kv_attention(monkeypatch):
     assert importlib.reload(m).Model.dense_kv_attention is False
     monkeypatch.delenv("OMLX_INKLING_KV8")
     assert importlib.reload(m).Model.dense_kv_attention is True
+
+
+@pytest.mark.parametrize("length", [1, 8])
+def test_q8_decode_kernel_matches_the_dequantized_path(length, monkeypatch):
+    import omlx.patches.inkling2.model as m
+
+    q, k, v, rel, sink = _inputs(length=length, s=1500)
+    on, off = Affine8KVCache(bits=8, seed=3), Affine8KVCache(bits=8, seed=3)
+    monkeypatch.setattr(m, "_Q8_DECODE", True)
+    got = Inkling2Attention.attend(_attn(), q, k, v, rel, sink, on)
+    monkeypatch.setattr(m, "_Q8_DECODE", False)
+    ref = Inkling2Attention.attend(_attn(), q, k, v, rel, sink, off)
+    assert _rel_err(got, ref) < 1e-2
+
+
+def test_q8_decode_kernel_reads_left_padded_batch_rows(monkeypatch):
+    import omlx.patches.inkling2.model as m
+    from omlx.patches.inkling2 import kernels as kn
+
+    q, k, v, rel, sink = _inputs(b=2, length=1, s=700)
+    cache = Affine8KVCache(bits=8, seed=3)
+    cache.update_and_fetch(k, v)
+    ks, vs = cache.state
+    qr = cache.key_codec.prepare_queries(q).astype(q.dtype)
+    pad = mx.array([0, 250], dtype=mx.int32)
+
+    class _S:
+        def __init__(self, st, n):
+            self.indices, self.norms, self.shape = st.indices, st.norms, (2, 8, n, 0)
+
+    got = kn.gqa_flash_decode_attention_q8(
+        qr, _S(ks, 700), _S(vs, 700), rel, sink, scale=128**-0.5, window=0, left_padding=pad
+    )
+    kd = cache.key_codec.dequantize_rotated(ks, mx.bfloat16)
+    vd = cache.value_codec.dequantize_rotated(vs, mx.bfloat16)
+    ref = kn.gqa_flash_decode_attention(
+        qr, kd, vd, rel, sink, scale=128**-0.5, window=0, left_padding=pad
+    )
+    assert _rel_err(got, ref) < 1e-2
+    assert monkeypatch is not None and m is not None
