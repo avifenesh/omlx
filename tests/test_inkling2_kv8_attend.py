@@ -145,3 +145,31 @@ def test_q8_verify_shared_tiles_match_per_position_kernel(b, length, pad, monkey
     )
     shared_err, per_pos_err = _rel_err(out[True], ref), _rel_err(out[False], ref)
     assert shared_err < 1e-2 and shared_err <= 1.25 * per_pos_err + 1e-3, (shared_err, per_pos_err)
+
+
+@pytest.mark.parametrize(
+    "b,length,pad,window",
+    [(1, 8, None, 0), (3, 8, [0, 300, 7], 0), (2, 16, None, 0), (2, 8, [0, 3], 64)],
+)
+def test_dense_verify_shared_tiles_match_reference(b, length, pad, window, monkeypatch):
+    from omlx.patches.inkling2 import kernels as kn
+
+    s = 120 if window else 2100
+    q, k, v, rel, sink = _inputs(b=b, length=length, s=s, r=64 if window else 16)
+    lp = None if pad is None else mx.array(pad, dtype=mx.int32)
+    out = {}
+    for shared in (True, False):
+        monkeypatch.setattr(kn, "_Q8_SHARED_TILES", shared)
+        out[shared] = kn.gqa_flash_decode_attention(
+            q, k, v, rel, sink, scale=128**-0.5, window=window, left_padding=lp
+        )
+    ref = kn._masked_attention(
+        q.astype(mx.float32), k.astype(mx.float32), v.astype(mx.float32),
+        rel.astype(mx.float32), sink.astype(mx.float32), 128**-0.5, window, lp,
+    )
+    shared_err, per_pos_err = _rel_err(out[True], ref), _rel_err(out[False], ref)
+    assert shared_err < 1e-2 and shared_err <= 1.25 * per_pos_err + 1e-3, (shared_err, per_pos_err)
+    # A lone row now takes the shared kernel through the dispatcher too.
+    monkeypatch.setattr(kn, "_Q8_SHARED_TILES", True)
+    routed = kn.banded_sink_attention(q, k, v, rel, sink, scale=128**-0.5, window=window, left_padding=lp)
+    assert _rel_err(routed, ref) < 1e-2
