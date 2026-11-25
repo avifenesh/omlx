@@ -40,6 +40,9 @@ class ArraysCache(_ArraysCache):
     arrives as the plain class and ``adopt`` turns it into this one.
     """
 
+    # A batched verify rolls every row back by one count (shared accept).
+    _omlx_mtp_batch_rollback_cache = True
+
     def __init__(self, size: int = SLOTS, left_padding=None, window: int = 0):
         super().__init__(size, left_padding)
         self.window = window

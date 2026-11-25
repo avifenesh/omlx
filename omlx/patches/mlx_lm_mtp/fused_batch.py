@@ -176,6 +176,42 @@ def _ragged_trim_rows(cache, accepted, depth):
             entry.__dict__.pop("is_speculating", None)
 
 
+def _uniform_accept(model):
+    """Backbones whose caches roll every row back by one count (no ragged trim)."""
+    return any(
+        getattr(host, "_omlx_mtp_uniform_accept", False) is True
+        for host in (
+            model,
+            getattr(model, "language_model", None),
+            getattr(model, "_language_model", None),
+        )
+        if host is not None
+    )
+
+
+def _clamp_to_shared_accept(greedy_results, stochastic_results, depth):
+    """Cut every row's accepted drafts to the fewest any row accepted.
+
+    A row that accepted more keeps that many drafts and emits its next accepted
+    draft as the correction token: the draft was accepted, so it is the target's
+    own token there (greedy) or a valid sample of the target's distribution
+    (stochastic). The output distribution is unchanged; only tokens per cycle drop.
+    Greedy packets: [accepted, targets(depth + 1), drafts(depth)].
+    Stochastic packets: [accepted, drafts(depth), corrections(depth), bonus].
+    """
+    if greedy_results is not None:
+        shared = min(int(packet[0]) for packet in greedy_results)
+        for packet in greedy_results:
+            # targets[shared] already equals drafts[shared] for longer accepts.
+            packet[0] = shared
+    if stochastic_results is not None:
+        shared = min(int(packet[0]) for packet in stochastic_results)
+        for packet in stochastic_results:
+            if int(packet[0]) > shared:
+                packet[0] = shared
+                packet[1 + depth + shared] = packet[1 + shared]
+
+
 def _independent_verify(model):
     """These backbones keep a singleton-only context for the draft head."""
     for host in (
@@ -410,10 +446,13 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
         ]
     else:
         mx.eval(logits, hidden)
+    uniform = _uniform_accept(batch.model)
+    if uniform:
+        _clamp_to_shared_accept(greedy_results, stochastic_results, depth)
     verify_ms = (time.perf_counter() - started) * 1000 / len(rows)
     vector_rollback = isinstance(gdn, SpeculativeCacheTransaction) or (
         whole_batch
-        and gdn is not None
+        and (gdn is not None or uniform)
         and all(_supports_batch_rollback(layer) for layer in cache)
         and any(
             getattr(host, "_omlx_mtp_batch_rollback", False)
@@ -426,7 +465,9 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
 
     def commit(accepted, row_index):
         if accepted not in committed:
-            view = copy.deepcopy(cache)
+            # Shared-accept rows all commit one length, so the merged cache
+            # (built for this cycle only) is rolled back in place.
+            view = cache if uniform and not whole_batch else copy.deepcopy(cache)
             if not bg._chain_rollback(batch.model, view, accepted, depth, gdn):
                 raise bg._MtpStepFallback("batched cache rejects scalar rollback")
             committed[accepted] = view
