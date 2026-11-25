@@ -189,6 +189,19 @@ def _uniform_accept(model):
     )
 
 
+def _verify_row_splitter(model):
+    """The backbone's ``extract_verify_row`` (row cache with its verify undo state)."""
+    for host in (
+        model,
+        getattr(model, "language_model", None),
+        getattr(model, "_language_model", None),
+    ):
+        split = getattr(host, "extract_verify_row", None) if host is not None else None
+        if callable(split):
+            return split
+    return None
+
+
 def _clamp_to_shared_accept(greedy_results, stochastic_results, depth):
     """Cut every row's accepted drafts to the fewest any row accepted.
 
@@ -457,11 +470,20 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
     deferred = []
     committed = {depth: cache}
 
+    split = _verify_row_splitter(batch.model) if uniform else None
+    per_row = {}
+
     def commit(accepted, row_index):
+        if split is not None:
+            # Shared-accept backbones cannot roll rows of one cache back by
+            # different counts; each row is split off and rolled back alone.
+            result = split(cache, row_index)
+            if not bg._chain_rollback(batch.model, result, accepted, depth, gdn):
+                raise bg._MtpStepFallback("row cache rejects scalar rollback")
+            bg._clear_rollback(result)
+            return result
         if accepted not in committed:
-            # Shared-accept rows all commit one length, so the merged cache
-            # (built for this cycle only) is rolled back in place.
-            view = cache if uniform and not whole_batch else copy.deepcopy(cache)
+            view = copy.deepcopy(cache)
             if not bg._chain_rollback(batch.model, view, accepted, depth, gdn):
                 raise bg._MtpStepFallback("batched cache rejects scalar rollback")
             committed[accepted] = view
@@ -486,7 +508,9 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
             commit_cache=(
                 (
                     lambda accepted, i=row_index, s=state: (
-                        cache
+                        per_row[i]
+                        if i in per_row
+                        else cache
                         if whole_batch and not s.boundary_emit_pending
                         else [c.extract(i) for c in cache]
                     )
@@ -512,9 +536,16 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
         # place. No extraction or merge is needed for the next target call.
         started = time.perf_counter()
         accepted_rows = [accepted for accepted, _ in deferred]
-        with _ragged_trim_rows(cache, accepted_rows, depth):
-            batch.model.rollback_speculative_cache(cache, gdn, accepted_rows, depth + 1)
-        if _ragged_mixed_with_plain_kv(cache):
+        if split is not None and len(set(accepted_rows)) > 1:
+            # A row lowered its own count after the shared clamp (stop sequence,
+            # token limit, boundary): roll each row back alone; the batch is
+            # rebuilt from the rows.
+            for i, accepted in enumerate(accepted_rows):
+                per_row[i] = commit(accepted, i)
+        else:
+            with _ragged_trim_rows(cache, accepted_rows, depth):
+                batch.model.rollback_speculative_cache(cache, gdn, accepted_rows, depth + 1)
+        if not per_row and _ragged_mixed_with_plain_kv(cache):
             _align_mixed_rows_if_needed(cache)
         commit_ms = (time.perf_counter() - started) * 1000 / len(rows)
         for (index, row, _), (_, finish) in zip(rows, deferred):
