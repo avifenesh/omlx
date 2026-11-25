@@ -1519,8 +1519,13 @@ class Model(nn.Module):
             )
         return SimpleNamespace(logits=logits, hidden_states=captures)
 
-    # Rows that accept different counts would need a ragged conv rollback.
-    _omlx_drafter_single_row = True
+    # Rows that accept different counts would need a ragged rollback: the
+    # attention kernels mask left padding only, and the relative bias band
+    # assumes every row ends at the same column. A batched verify instead cuts
+    # every row to the fewest accepted drafts (fused_batch._clamp_to_shared_accept),
+    # so each rollback trims all rows by one count. Off: OMLX_INKLING_BATCH_SPEC=0.
+    _omlx_drafter_single_row = os.environ.get("OMLX_INKLING_BATCH_SPEC", "1") == "0"
+    _omlx_mtp_uniform_accept = True
 
     def mtp_partial_rollback(self, cache, accepted: int, num_drafts: int) -> bool:
         """Drop the rejected drafts of a ``num_drafts + 1``-token verify."""
@@ -1536,6 +1541,9 @@ class Model(nn.Module):
             if kv is None:
                 if not windows.trim(conv, rejected):
                     return False
+            elif kv.__dict__.get("is_speculating", False):
+                # Already trimmed per row by fused_batch._ragged_trim_rows.
+                pass
             elif kv.trim(rejected) != rejected:
                 return False
             base = windows.CONV if kv is None else 0
@@ -1548,6 +1556,11 @@ class Model(nn.Module):
         return True
 
     def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
+        if isinstance(accepted, (list, tuple)):
+            counts = {int(a) for a in accepted}
+            if len(counts) != 1:
+                raise RuntimeError("Inkling 2 rolls every batch row back by one count")
+            accepted = counts.pop()
         accepted = int(accepted)
         if not self.mtp_partial_rollback(caches, accepted, int(block_size) - 1):
             raise RuntimeError("Inkling 2 verify rollback found no conv windows")
