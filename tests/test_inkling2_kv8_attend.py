@@ -112,3 +112,36 @@ def test_q8_decode_kernel_reads_left_padded_batch_rows(monkeypatch):
     )
     assert _rel_err(got, ref) < 1e-2
     assert monkeypatch is not None and m is not None
+
+
+@pytest.mark.parametrize("b,length,pad", [(1, 2, None), (1, 8, None), (2, 8, [0, 300]), (3, 16, [5, 0, 900])])
+def test_q8_verify_shared_tiles_match_per_position_kernel(b, length, pad, monkeypatch):
+    from omlx.patches.inkling2 import kernels as kn
+
+    q, k, v, rel, sink = _inputs(b=b, length=length, s=2100)
+    cache = Affine8KVCache(bits=8, seed=3)
+    cache.update_and_fetch(k, v)
+    ks, vs = cache.state
+    qr = cache.key_codec.prepare_queries(q).astype(q.dtype)
+    lp = None if pad is None else mx.array(pad, dtype=mx.int32)
+
+    class _S:
+        def __init__(self, st):
+            self.indices, self.norms, self.shape = st.indices, st.norms, (b, 8, 2100, 0)
+
+    out = {}
+    for shared in (True, False):
+        monkeypatch.setattr(kn, "_Q8_SHARED_TILES", shared)
+        out[shared] = kn.gqa_flash_decode_attention_q8(
+            qr, _S(ks), _S(vs), rel, sink, scale=128**-0.5, window=0, left_padding=lp
+        )
+    # Tiles and chunks group keys differently per row, so the two kernels
+    # round differently; both must be as close to an FP32 reference.
+    kd = cache.key_codec.dequantize_rotated(ks, mx.float32)
+    vd = cache.value_codec.dequantize_rotated(vs, mx.float32)
+    ref = kn._masked_attention(
+        qr.astype(mx.float32), kd, vd, rel.astype(mx.float32), sink.astype(mx.float32),
+        128**-0.5, 0, lp,
+    )
+    shared_err, per_pos_err = _rel_err(out[True], ref), _rel_err(out[False], ref)
+    assert shared_err < 1e-2 and shared_err <= 1.25 * per_pos_err + 1e-3, (shared_err, per_pos_err)
