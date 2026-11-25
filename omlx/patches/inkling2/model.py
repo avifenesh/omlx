@@ -1491,6 +1491,21 @@ class Model(nn.Module):
             cache[-1][0] = cache[-1]._omlx_verify_xp[:, keep - 1 : keep]
         return True
 
+    def extract_verify_row(self, cache, index: int) -> list:
+        """Row ``index`` of a batched cache right after a verify forward, with
+        its conv verify windows, so ``mtp_partial_rollback`` can roll it back
+        alone (a row that lowered its own accepted count: stop, token limit)."""
+        rows = [entry.extract(index) for entry in cache]
+        for (_, conv), (_, row_conv) in zip(
+            self.model.visit_caches(cache), self.model.visit_caches(rows)
+        ):
+            padded = getattr(conv, "_omlx_verify_xp", None)
+            if padded is not None:
+                row_conv._omlx_verify_xp = {
+                    slot: xp[index : index + 1] for slot, xp in padded.items()
+                }
+        return rows
+
     def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
         if isinstance(accepted, (list, tuple)):
             counts = {int(a) for a in accepted}

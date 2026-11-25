@@ -83,3 +83,39 @@ def test_clamp_stochastic_emits_the_accepted_draft():
     _clamp_to_shared_accept(None, [a, b], depth)
     assert a[0] == 1 and a[1 + depth + 1] == 12  # its accepted second draft
     assert b == [1, 31, 32, 33, 41, 42, 43, 98]  # the shortest row is untouched
+
+
+@pytest.mark.parametrize("dims", [{}, _TINY_LOOP], ids=["plain", "looped"])
+def test_rows_with_different_counts_roll_back_alone_and_rejoin(dims):
+    # A row can lower its own count after the shared clamp (stop sequence,
+    # token limit): each row is split off with its verify windows, rolled
+    # back alone, and the batch is rebuilt from the rows.
+    model = _inkling2_tiny(sliding_window_size=16, rel_extent=16, **dims)
+    drafts, counts = 7, (2, 5)
+    ids = mx.random.randint(0, 300, (2, 80))
+    lengths = (37, 12)
+    alone, expected = [], []
+    for row, n in enumerate(lengths):
+        cache = model.make_cache()
+        model(ids[row : row + 1, :n], cache=cache)
+        alone.append(cache)
+        reference = model.make_cache()
+        model(ids[row : row + 1, : n + counts[row] + 1], cache=reference)
+        nxt = n + counts[row] + 1
+        expected.append(model(ids[row : row + 1, nxt : nxt + 1], cache=reference))
+    joined = _join(alone)
+    block = mx.stack([ids[r, n : n + drafts + 1] for r, n in enumerate(lengths)])
+    mx.eval(model(block, cache=joined, return_hidden=True, capture_layer_ids=[5]).logits)
+    rows = []
+    for i, accepted in enumerate(counts):
+        row = model.extract_verify_row(joined, i)
+        assert model.mtp_partial_rollback(row, accepted, drafts)
+        rows.append(row)
+    rejoined = _join(rows)
+    nxt = mx.stack(
+        [ids[r, n + counts[r] + 1 : n + counts[r] + 2] for r, n in enumerate(lengths)]
+    )
+    got = model(nxt, cache=rejoined)
+    for row in range(2):
+        diff = mx.abs(got[row : row + 1, :, :300] - expected[row][..., :300]).max().item()
+        assert diff < 1e-3, (row, diff)
