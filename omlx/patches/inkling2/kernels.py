@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 
 import mlx.core as mx
 
@@ -1471,6 +1472,102 @@ def _q8_part_source() -> str:
 _decode_q8_part = None
 
 
+# Verify blocks (L > 1 queries) over the 8-bit cache: one threadgroup per KV
+# head serves every query position, so each K/V tile is staged once instead of
+# once per position. Tiles are indexed by distance from the block's newest key;
+# a row (position, head) at position p is L - 1 - p keys behind it, so its own
+# distance, causal end, bias band and window are shifted per row.
+def _q8_rows_part_source() -> str:
+    src = _q8_part_source()
+    edits = [
+        (
+            "    const int pos = gy % L;\n    const int hk = gy / L;\n",
+            "    const int hk = gy;\n",
+        ),
+        (
+            "    // The G query heads of this KV head are the rows of the tile.\n"
+            "    const int g = int(sg) * 8 + fm;\n"
+            "    const bool row_ok = g < G;\n"
+            "    const int h = hk * G + (row_ok ? g : 0);\n",
+            "    // Rows of the tile are (position, head) pairs of this KV head.\n"
+            "    const int rr = int(sg) * 8 + fm;\n"
+            "    const bool row_ok = rr < L * G;\n"
+            "    const int pos = row_ok ? rr / G : 0;\n"
+            "    const int g = row_ok ? rr % G : 0;\n"
+            "    const int h = hk * G + g;\n"
+            "    const int shift = L - 1 - pos;\n",
+        ),
+        (
+            "    const int a = S - L + pos;\n"
+            "    int nk = a + 1 - lp;\n"
+            "    if (WINDOW > 0) {\n"
+            "        nk = min(nk, WINDOW);\n"
+            "    }\n",
+            "    // Keys any row of the block sees, counted back from the newest one.\n"
+            "    int nk = S - lp;\n"
+            "    if (WINDOW > 0) {\n"
+            "        nk = min(nk, WINDOW + L - 1);\n"
+            "    }\n",
+        ),
+        (
+            "                const int key = a - d0 - r;\n",
+            "                const int key = (S - 1) - d0 - r;\n",
+        ),
+        (
+            "        if (int(sg) * 8 >= G) {\n",
+            "        if (int(sg) * 8 >= L * G) {\n",
+        ),
+        (
+            "        // Every tile holds a visible key (d0 < d_end), so rmax is a score.\n",
+            "        // A row may see no key of a tile (the newest keys of earlier\n"
+            "        // positions); its rmax then stays -FLT_MAX and its p are zero.\n",
+        ),
+        (
+            "                const int d = d0 + kb * 8 + fn + e;\n"
+            "                float s = Sf[kb].thread_elements()[e] * qscale;\n"
+            "                if (d < R) {\n"
+            "                    s += float(relp[d]) * LOG2E;\n"
+            "                }\n"
+            "                sc[kb * 2 + e] = s;\n"
+            "                if (d < d_end) {\n",
+            "                const int dd = d0 + kb * 8 + fn + e;\n"
+            "                const int d = dd - shift;\n"
+            "                float s = Sf[kb].thread_elements()[e] * qscale;\n"
+            "                if (d >= 0 && d < R) {\n"
+            "                    s += float(relp[d]) * LOG2E;\n"
+            "                }\n"
+            "                sc[kb * 2 + e] = s;\n"
+            "                if (dd < d_end && d >= 0 && (WINDOW == 0 || d < WINDOW)) {\n",
+        ),
+        (
+            "                const int d = d0 + kb * 8 + fn + e;\n"
+            "                const float p = d < d_end\n",
+            "                const int dd = d0 + kb * 8 + fn + e;\n"
+            "                const int d = dd - shift;\n"
+            "                const float p = (dd < d_end && d >= 0 && (WINDOW == 0 || d < WINDOW))\n",
+        ),
+        (
+            "        const float m_new = first ? rmax : max(m, rmax);\n"
+            "        const float factor = first ? 0.0f : precise::exp2(m - m_new);\n",
+            "        const float m_new = first ? rmax : max(m, rmax);\n"
+            "        // exp2 of -FLT_MAX - -FLT_MAX is 1 and l is still 0 then.\n"
+            "        const float factor = first ? 0.0f : precise::exp2(m - m_new);\n",
+        ),
+    ]
+    for old, new in edits:
+        if src.count(old) != 1:
+            raise RuntimeError(f"q8 verify kernel: anchor not found once: {old[:60]!r}")
+        src = src.replace(old, new)
+    return src
+
+
+_decode_q8_rows_part = None
+# Off: OMLX_INKLING_Q8_SHARED=0 (verify blocks re-stage tiles per position).
+_Q8_SHARED_TILES = os.environ.get("OMLX_INKLING_Q8_SHARED", "1") != "0"
+# Simdgroups of 8 (position, head) rows per threadgroup (1024 threads max).
+_Q8_MAX_ROW_GROUPS = 32
+
+
 def q8_decode_supported(q, k_state, kv) -> bool:
     """Decode-sized blocks over an 8-bit affine cache the q8 kernel can read."""
     indices = getattr(k_state, "indices", None)
@@ -1503,7 +1600,7 @@ def gqa_flash_decode_attention_q8(
     output is in the value rotation. S is the cached length the caller passes
     through the state's ``shape``.
     """
-    global _decode_q8_part, _decode_kernels
+    global _decode_q8_part, _decode_q8_rows_part, _decode_kernels
     b, hq, length, d = q.shape
     k_idx, v_idx = k_state.indices, v_state.indices
     k_sc, v_sc = k_state.norms, v_state.norms
@@ -1525,14 +1622,26 @@ def gqa_flash_decode_attention_q8(
             rel[:1, :1], sink[:1, :1], scale=scale, window=window,
         )
     fold = _decode_kernels[1]
-    reach = min(s, window) if window else s
+    # Verify blocks share each staged tile across their positions.
+    shared = length > 1 and _Q8_SHARED_TILES and length * g <= 8 * _Q8_MAX_ROW_GROUPS
+    if shared and _decode_q8_rows_part is None:
+        _decode_q8_rows_part = mx.fast.metal_kernel(
+            name="omlx_inkling2_flash_verify_part_q8",
+            input_names=["q", "k", "v", "ks", "vs", "rel", "dims", "scale"],
+            output_names=["part_o", "part_m", "part_l"],
+            source=_q8_rows_part_source(),
+            ensure_row_contiguous=False,
+        )
+    reach = min(s, window + (length - 1 if shared else 0)) if window else s
     chunk = _DECODE_SLIDING_CHUNK if window else _DECODE_CHUNK
     ns = max(1, -(-reach // chunk))
-    nsg = max(-(-g // 8), _DECODE_STAGERS)
+    rows = length * g if shared else g
+    nsg = max(-(-rows // 8), _DECODE_STAGERS)
     dims = mx.array([length, s, ns] + [0] * b, dtype=mx.int32)
     if left_padding is not None:
         dims = mx.concatenate([dims[:3], left_padding.astype(mx.int32)])
-    part_o, part_m, part_l = _decode_q8_part(
+    kernel = _decode_q8_rows_part if shared else _decode_q8_part
+    part_o, part_m, part_l = kernel(
         inputs=[
             q, k_idx, v_idx, k_sc, v_sc, mx.contiguous(rel), dims,
             mx.array([scale], dtype=mx.float32),
@@ -1549,7 +1658,7 @@ def gqa_flash_decode_attention_q8(
             ("CHUNK", chunk),
             ("NSG", nsg),
         ],
-        grid=(ns * nsg * 32, hkv * length, b),
+        grid=(ns * nsg * 32, hkv * (1 if shared else length), b),
         threadgroup=(nsg * 32, 1, 1),
         output_shapes=[
             (b, hq, length, ns, d),
