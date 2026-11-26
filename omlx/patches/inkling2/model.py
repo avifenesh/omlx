@@ -1288,10 +1288,10 @@ class Inkling2TextModel(nn.Module):
 
 
 class Model(nn.Module):
-    # ``attend`` reads dense keys and values, or (OMLX_INKLING_KV8=1) the
-    # rotated codes of an affine cache, which it turns back into rotated dense
-    # rows for the same kernels. Without the flag the cache stays dense.
-    dense_kv_attention = os.environ.get("OMLX_INKLING_KV8", "0") != "1"
+    # ``attend`` reads dense keys and values or the rotated codes of an affine
+    # cache, so the turboquant_kv model setting alone decides the cache format.
+    # OMLX_INKLING_KV8=0 keeps every cache dense regardless of the setting.
+    dense_kv_attention = os.environ.get("OMLX_INKLING_KV8", "1") == "0"
     # Verify windows up to the compiled width keep the compiled forward, and
     # mtp_partial_rollback recuts the conv tails for any rejected count.
     _omlx_mtp_max_verify_rows = _COMPILED_MAX_TOKENS

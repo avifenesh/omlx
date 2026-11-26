@@ -1646,20 +1646,33 @@ def test_inkling2_thinking_switch_reaches_the_template_effort(kwargs, effort):
 
 
 @pytest.mark.parametrize("engine", ["text", "vlm"])
-def test_inkling2_keeps_dense_kv_when_kv_quantization_is_on(mock_tokenizer, engine):
-    """Its attention reads dense keys: a packed cache fails on the first forward."""
+def test_inkling2_affine8_setting_alone_converts_the_cache(
+    mock_tokenizer, engine, monkeypatch
+):
+    """Its attention reads affine codes, so the affine8 setting converts the
+    cache without an environment switch; OMLX_INKLING_KV8=0 keeps it dense."""
+    import importlib
     from types import SimpleNamespace
 
+    import omlx.patches.inkling2.model as m
     from omlx.models.vlm import VLMModelAdapter
     from omlx.scheduler import Scheduler
 
-    model = _inkling2_tiny()
-    if engine == "vlm":
-        model = VLMModelAdapter(SimpleNamespace(language_model=model))
-    scheduler = Scheduler(model=model, tokenizer=mock_tokenizer)
-    scheduler._turboquant_kv_bits = 8.0
-    scheduler._turboquant_kv_scheme = "affine8"
-    assert not scheduler._turboquant_eligible(model.make_cache())
+    for env, eligible in ((None, True), ("0", False)):
+        if env is None:
+            monkeypatch.delenv("OMLX_INKLING_KV8", raising=False)
+        else:
+            monkeypatch.setenv("OMLX_INKLING_KV8", env)
+        importlib.reload(m)
+        model = _inkling2_tiny()
+        if engine == "vlm":
+            model = VLMModelAdapter(SimpleNamespace(language_model=model))
+        scheduler = Scheduler(model=model, tokenizer=mock_tokenizer)
+        scheduler._turboquant_kv_bits = 8.0
+        scheduler._turboquant_kv_scheme = "affine8"
+        assert scheduler._turboquant_eligible(model.make_cache()) is eligible
+    monkeypatch.delenv("OMLX_INKLING_KV8", raising=False)
+    importlib.reload(m)
 
 
 def test_inkling2_varloop_single_pass_and_dspark_visit_guard(tmp_path):
