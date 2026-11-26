@@ -68,10 +68,12 @@ def test_flag_controls_dense_kv_attention(monkeypatch):
 
     import omlx.patches.inkling2.model as m
 
-    monkeypatch.setenv("OMLX_INKLING_KV8", "1")
+    monkeypatch.delenv("OMLX_INKLING_KV8", raising=False)
     assert importlib.reload(m).Model.dense_kv_attention is False
-    monkeypatch.delenv("OMLX_INKLING_KV8")
+    monkeypatch.setenv("OMLX_INKLING_KV8", "0")
     assert importlib.reload(m).Model.dense_kv_attention is True
+    monkeypatch.delenv("OMLX_INKLING_KV8")
+    importlib.reload(m)
 
 
 @pytest.mark.parametrize("length", [1, 8])
