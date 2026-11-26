@@ -1514,7 +1514,92 @@ def _q8_part_source() -> str:
     return src[:head] + staging + src[tail:]
 
 
-_decode_q8_part = None
+def _q8v5_part_source() -> str:
+    """``_q8_part_source`` for 8-bit keys and 5-bit values (dense bit stream,
+    32 codes per 5 words)."""
+    src = _DECODE_PART_SOURCE
+    head = src.index("    const device T* kb_ptr")
+    tail = src.index(
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "        if (int(sg) * 8 >= G) {"
+    )
+    staging = """    const device uint* kb_ptr = k + b * k_strides[0] + hk * k_strides[1];
+    const device uint* vb_ptr = v + b * v_strides[0] + hk * v_strides[1];
+    const device SC* ksb = ks + b * ks_strides[0] + hk * ks_strides[1];
+    const device SC* vsb = vs + b * vs_strides[0] + hk * vs_strides[1];
+    const bool vec_k = k_strides[3] == 1 && (k_strides[2] & 3) == 0
+        && (uintptr_t(kb_ptr) & 15) == 0;
+    #define KEY_OF(d0_, r_) (a - (d0_) - (r_))
+
+    // Slot r of a tile is the key at distance d0 + r.
+    for (int d0 = d_begin; d0 < d_end; d0 += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int c = tid; c < BK * (D / 16); c += NT) {
+            const int r = c / (D / 16);
+            const int w4 = c % (D / 16);
+            uint4 kw = uint4(0u);
+            float ksc = 0.0f;
+            if (d0 + r < d_end) {
+                const int key = KEY_OF(d0, r);
+                const device uint* kp = kb_ptr + key * k_strides[2];
+                kw = vec_k ? *(const device uint4*)(kp + w4 * 4)
+                           : uint4(kp[(w4 * 4) * k_strides[3]], kp[(w4 * 4 + 1) * k_strides[3]],
+                                   kp[(w4 * 4 + 2) * k_strides[3]], kp[(w4 * 4 + 3) * k_strides[3]]);
+                ksc = float(ksb[key * ks_strides[2]]);
+            }
+            for (int i = 0; i < 4; ++i) {
+                for (int j = 0; j < 4; ++j) {
+                    const int col = w4 * 16 + i * 4 + j;
+                    const float kc = float(int(((kw[i] >> (8 * j)) & 0xFFu) ^ 0x80u) - 128);
+                    Ks[col * LDK + r] = half(kc * ksc);
+                }
+            }
+        }
+        for (int c = tid; c < BK * (D / 32); c += NT) {
+            const int r = c / (D / 32);
+            const int g32 = c % (D / 32);
+            uint vw[6] = {0u, 0u, 0u, 0u, 0u, 0u};
+            float vsc = 0.0f;
+            if (d0 + r < d_end) {
+                const int key = KEY_OF(d0, r);
+                const device uint* vp = vb_ptr + key * v_strides[2] + g32 * 5 * v_strides[3];
+                for (int i = 0; i < 5; ++i) {
+                    vw[i] = vp[i * v_strides[3]];
+                }
+                vsc = float(vsb[key * vs_strides[2]]);
+            }
+            for (int j = 0; j < 32; ++j) {
+                const int bit = 5 * j;
+                const int w = bit >> 5;
+                const int off = bit & 31;
+                uint code = vw[w] >> off;
+                if (off > 27) {
+                    code |= vw[w + 1] << (32 - off);
+                }
+                const float vc = float(int((code & 31u) ^ 16u) - 16);
+                Vs[r * LDV + g32 * 32 + j] = half(vc * vsc);
+            }
+        }
+"""
+    return src[:head] + staging + src[tail:]
+
+
+_q8_kernels: dict = {}
+
+
+def _q8_kernel(v5: bool, shared: bool):
+    key = (v5, shared)
+    if key not in _q8_kernels:
+        src = _q8v5_part_source() if v5 else _q8_part_source()
+        _q8_kernels[key] = mx.fast.metal_kernel(
+            name="omlx_inkling2_flash_" + ("verify" if shared else "decode")
+            + "_part_q8" + ("v5" if v5 else ""),
+            input_names=["q", "k", "v", "ks", "vs", "rel", "dims", "scale"],
+            output_names=["part_o", "part_m", "part_l"],
+            source=_rows_part_source(src) if shared else src,
+            ensure_row_contiguous=False,
+        )
+    return _q8_kernels[key]
 
 
 # Verify blocks (L > 1 queries) over the 8-bit cache: one threadgroup per KV
@@ -1522,10 +1607,6 @@ _decode_q8_part = None
 # once per position. Tiles are indexed by distance from the block's newest key;
 # a row (position, head) at position p is L - 1 - p keys behind it, so its own
 # distance, causal end, bias band and window are shifted per row.
-def _q8_rows_part_source() -> str:
-    return _rows_part_source(_q8_part_source())
-
-
 def _rows_part_source(src: str) -> str:
     """The shared-tile verify variant of a decode part kernel source."""
     src = src.replace(
@@ -1618,7 +1699,6 @@ def _rows_part_source(src: str) -> str:
     return src
 
 
-_decode_q8_rows_part = None
 _decode_rows_part = None
 # Off: OMLX_INKLING_Q8_SHARED=0 (verify blocks re-stage tiles per position).
 _Q8_SHARED_TILES = os.environ.get("OMLX_INKLING_Q8_SHARED", "1") != "0"
@@ -1632,7 +1712,7 @@ def q8_decode_supported(q, k_state, kv) -> bool:
     norms = getattr(k_state, "norms", None)
     return (
         getattr(getattr(kv, "key_codec", None), "bits", None) == 8
-        and getattr(getattr(kv, "value_codec", None), "bits", None) == 8
+        and getattr(getattr(kv, "value_codec", None), "bits", None) in (5, 8)
         and indices is not None
         and indices.dtype == mx.uint32
         and norms is not None
@@ -1658,21 +1738,13 @@ def gqa_flash_decode_attention_q8(
     output is in the value rotation. S is the cached length the caller passes
     through the state's ``shape``.
     """
-    global _decode_q8_part, _decode_q8_rows_part, _decode_kernels
+    global _decode_kernels
     b, hq, length, d = q.shape
     k_idx, v_idx = k_state.indices, v_state.indices
     k_sc, v_sc = k_state.norms, v_state.norms
     hkv = k_idx.shape[1]
     s = int(k_state.shape[2])
     g = hq // hkv
-    if _decode_q8_part is None:
-        _decode_q8_part = mx.fast.metal_kernel(
-            name="omlx_inkling2_flash_decode_part_q8",
-            input_names=["q", "k", "v", "ks", "vs", "rel", "dims", "scale"],
-            output_names=["part_o", "part_m", "part_l"],
-            source=_q8_part_source(),
-            ensure_row_contiguous=False,
-        )
     if _decode_kernels is None:
         # Builds the shared fold kernel.
         gqa_flash_decode_attention(
@@ -1682,14 +1754,8 @@ def gqa_flash_decode_attention_q8(
     fold = _decode_kernels[1]
     # Verify blocks share each staged tile across their positions.
     shared = length > 1 and _Q8_SHARED_TILES and length * g <= 8 * _Q8_MAX_ROW_GROUPS
-    if shared and _decode_q8_rows_part is None:
-        _decode_q8_rows_part = mx.fast.metal_kernel(
-            name="omlx_inkling2_flash_verify_part_q8",
-            input_names=["q", "k", "v", "ks", "vs", "rel", "dims", "scale"],
-            output_names=["part_o", "part_m", "part_l"],
-            source=_q8_rows_part_source(),
-            ensure_row_contiguous=False,
-        )
+    v5 = v_idx.shape[-1] * 32 == d * 5
+    kernel = _q8_kernel(v5, shared)
     reach = min(s, window + (length - 1 if shared else 0)) if window else s
     chunk = _DECODE_SLIDING_CHUNK if window else _DECODE_CHUNK
     ns = max(1, -(-reach // chunk))
@@ -1698,7 +1764,6 @@ def gqa_flash_decode_attention_q8(
     dims = mx.array([length, s, ns] + [0] * b, dtype=mx.int32)
     if left_padding is not None:
         dims = mx.concatenate([dims[:3], left_padding.astype(mx.int32)])
-    kernel = _decode_q8_rows_part if shared else _decode_q8_part
     part_o, part_m, part_l = kernel(
         inputs=[
             q, k_idx, v_idx, k_sc, v_sc, mx.contiguous(rel), dims,

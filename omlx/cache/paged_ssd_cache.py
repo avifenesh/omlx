@@ -418,6 +418,11 @@ def numerics_revision_for_model(model: Any) -> str | None:
     # Set by cast_bf16_params_to_fp16: KV computed before the recast is bf16.
     if any(getattr(module, "_omlx_fp16_recast", False) for module in modules):
         revisions.add("fp16-recast")
+    # affine8 caches with 5-bit values hold another packed value width.
+    from ..affine4 import _VALUE_BITS
+
+    if _VALUE_BITS != 8:
+        revisions.add(f"affine8-v{_VALUE_BITS}")
     # Set by apply_adapter: KV depends on the LoRA weights.
     revisions.update(
         f"lora-{signature}"

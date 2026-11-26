@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import struct
 from functools import cache, lru_cache
 
@@ -25,6 +26,8 @@ logger = logging.getLogger(__name__)
 
 AFFINE4_SCHEME = "affine4"
 AFFINE8_SCHEME = "affine8"
+# Value code width of affine8 caches (8, or 5 for 8-bit keys with 5-bit values).
+_VALUE_BITS = int(os.environ.get("OMLX_AFFINE8_VALUE_BITS", "8"))
 
 __all__ = [
     "AFFINE4_SCHEME",
@@ -144,6 +147,9 @@ class Affine4Codec:
             mx.round(rotated / divisor), self.minimum_code, self.maximum_code
         ).astype(mx.int8)
         encoded = codes.astype(mx.uint32) & ((1 << self.bits) - 1)
+        return TurboQuantMSEState(scales, self._pack(encoded))
+
+    def _pack(self, encoded: mx.array) -> mx.array:
         if mx.default_device() == mx.cpu:
             width = (self.dim + self.values_per_word - 1) // self.values_per_word
             encoded = mx.pad(
@@ -163,7 +169,7 @@ class Affine4Codec:
             )
         else:
             packed = _pack_lowbit(encoded, self.bits)
-        return TurboQuantMSEState(scales, packed)
+        return packed
 
     def _codes(self, state: TurboQuantMSEState) -> mx.array:
         if mx.default_device() == mx.cpu:
@@ -241,6 +247,26 @@ class Affine8Codec(Affine4Codec):
     """Signed int8 codec with deterministic orthonormal rotation."""
 
     bits = 8
+
+
+class Affine5Codec(Affine4Codec):
+    """Signed 5-bit codec; codes are a dense bit stream (20 words per 128 dims)."""
+
+    bits = 5
+
+    def _pack(self, encoded: mx.array) -> mx.array:
+        return _pack_lowbit(encoded, self.bits)
+
+    def _codes(self, state: TurboQuantMSEState) -> mx.array:
+        encoded = _unpack_lowbit(state.indices, self.bits, self.dim).astype(mx.int16)
+        sign = 1 << (self.bits - 1)
+        return ((encoded ^ sign) - sign).astype(mx.float32)
+
+    def dequantize_rotated(
+        self, state: TurboQuantMSEState, dtype=mx.float32
+    ) -> mx.array:
+        scales = state.norms.astype(mx.float32)[..., None]
+        return (self._codes(state) * scales).astype(dtype)
 
 
 _FUSED_QUANTIZE_SOURCE = r"""
@@ -1034,6 +1060,10 @@ class Affine4KVCache(TurboQuantKVCache):
 
     bits = 4
     codec_class = Affine4Codec
+
+    @property
+    def value_codec_class(self):
+        return self.codec_class
     quantization_scheme = AFFINE4_SCHEME
 
     def __init__(self, bits: float | None = None, seed: int = 0):
@@ -1120,7 +1150,10 @@ class Affine4KVCache(TurboQuantKVCache):
                     raise ValueError(
                         f"{self.quantization_scheme} {name} dimension differs from metadata"
                     )
-                setattr(self, f"{name}_codec", self.codec_class(dim, seed))
+                codec_class = (
+                    self.value_codec_class if name == "value" else self.codec_class
+                )
+                setattr(self, f"{name}_codec", codec_class(dim, seed))
                 setattr(self, f"_{name}_dim", dim)
             elif codec.dim != dim:
                 raise ValueError(
@@ -1167,7 +1200,9 @@ class Affine4KVCache(TurboQuantKVCache):
         self.bits, self.seed = bits, seed
         self._key_dim, self._value_dim = key_dim, value_dim
         self.key_codec = self.codec_class(key_dim, seed) if key_dim else None
-        self.value_codec = self.codec_class(value_dim, seed + 1) if value_dim else None
+        self.value_codec = (
+            self.value_codec_class(value_dim, seed + 1) if value_dim else None
+        )
         if hasattr(self, "left_padding"):
             self._row_ends = None
             self._phys_end = offset
@@ -1217,11 +1252,11 @@ class Affine4KVCache(TurboQuantKVCache):
             )
         self._key_dim, self._value_dim = dimensions
         self.key_codec = self.codec_class(dimensions[0], self.seed)
-        self.value_codec = self.codec_class(dimensions[1], self.seed + 1)
+        self.value_codec = self.value_codec_class(dimensions[1], self.seed + 1)
 
     def _try_fused_kv_quantize(self, keys, values):
         self._ensure_codecs(keys, values)
-        if mx.default_device() != mx.gpu:
+        if mx.default_device() != mx.gpu or self.value_codec.bits != self.key_codec.bits:
             return None, None
         dim = keys.shape[-1]
         signature = (
@@ -1478,6 +1513,11 @@ class Affine8KVCache(Affine4KVCache):
 
     bits = 8
     codec_class = Affine8Codec
+
+    @property
+    def value_codec_class(self):
+        # OMLX_AFFINE8_VALUE_BITS=5: keys stay 8-bit, values are 5-bit codes.
+        return Affine5Codec if _VALUE_BITS == 5 else Affine8Codec
     quantization_scheme = AFFINE8_SCHEME
 
 
