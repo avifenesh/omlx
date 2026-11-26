@@ -29,7 +29,9 @@ def _inputs(b=1, hq=24, hkv=8, length=1, s=300, d=128, r=16, seed=0):
 
 
 def _attn(window=0):
-    return SimpleNamespace(scale=128**-0.5, window=window)
+    attn = SimpleNamespace(scale=128**-0.5, window=window)
+    attn._long_attention = lambda *a: Inkling2Attention._long_attention(attn, *a)
+    return attn
 
 
 def _rel_err(a, b):
