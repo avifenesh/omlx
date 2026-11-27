@@ -1392,10 +1392,22 @@ def gqa_flash_decode_attention(q, k, v, rel, sink, *, scale, window, left_paddin
         )
     part, fold = _decode_kernels
     # Verify blocks share each staged tile across their positions.
-    shared = (
-        length > 1 and not window and _Q8_SHARED_TILES and length * g <= 8 * _Q8_MAX_ROW_GROUPS
+    shared = length > 1 and _Q8_SHARED_TILES and (
+        (not window and length * g <= 8 * _Q8_MAX_ROW_GROUPS)
+        or (window and length <= _WINDOW_ROWS_MAX and g <= 8)
     )
-    if shared:
+    if shared and window:
+        global _decode_window_rows_part
+        if _decode_window_rows_part is None:
+            _decode_window_rows_part = mx.fast.metal_kernel(
+                name="omlx_inkling2_flash_verify_window_part",
+                input_names=["q", "k", "v", "rel", "dims", "scale"],
+                output_names=["part_o", "part_m", "part_l"],
+                source=_window_rows_part_source(_DECODE_PART_SOURCE),
+                ensure_row_contiguous=False,
+            )
+        part = _decode_window_rows_part
+    elif shared:
         global _decode_rows_part
         if _decode_rows_part is None:
             _decode_rows_part = mx.fast.metal_kernel(
@@ -1408,7 +1420,10 @@ def gqa_flash_decode_attention(q, k, v, rel, sink, *, scale, window, left_paddin
         part = _decode_rows_part
     chunk = _DECODE_SLIDING_CHUNK if window else _DECODE_CHUNK
     ns = _decode_chunks(s, window, chunk)
-    nsg = max(-(-(length * g if shared else g) // 8), _DECODE_STAGERS)
+    if shared and window:
+        nsg = max(length, _DECODE_STAGERS)
+    else:
+        nsg = max(-(-(length * g if shared else g) // 8), _DECODE_STAGERS)
     dims = mx.array([length, s, ns] + [0] * b, dtype=mx.int32)
     if left_padding is not None:
         dims = mx.concatenate([dims[:3], left_padding.astype(mx.int32)])
@@ -1569,12 +1584,76 @@ def _rows_part_source(src: str) -> str:
     return src
 
 
+def _window_rows_part_source(src: str) -> str:
+    """The shared-tile verify variant for windowed rows: one simdgroup per
+    position keeps the decode step's own-key tiles, and each staged tile step
+    holds BK + L - 1 keys so every position reads its 16 at its own offset."""
+    edits = [
+        (
+            "    const int pos = gy % L;\n    const int hk = gy / L;\n",
+            "    const int hk = gy;\n    const int pos = min(int(sg), L - 1);\n",
+        ),
+        (
+            "    const int g = int(sg) * 8 + fm;\n    const bool row_ok = g < G;\n",
+            "    const int g = fm;\n    const bool row_ok = g < G && int(sg) < L;\n",
+        ),
+        (
+            "    const int d_end = ua < 0 ? d_begin : min(d_begin + CHUNK, row_end);\n",
+            "    const int lag = L - 1 - pos;\n"
+            "    const int d_end = S - lp <= 0 ? d_begin : min(d_begin + CHUNK, min(S - lp, WINDOW));\n",
+        ),
+        ("    constexpr int LDK = BK + 8;\n", "    constexpr int LDK = BK + 16;\n"),
+        ("    threadgroup half Vs[BK * LDV];\n", "    threadgroup half Vs[(BK + 7) * LDV];\n"),
+        (
+            "            for (int c = tid; c < BK * D / 8; c += NT) {\n",
+            "            for (int c = tid; c < (BK + L - 1) * D / 8; c += NT) {\n",
+        ),
+        (
+            "                if (d0 + r < d_end && d0 + r >= e_lo) {\n"
+            "                    const int key = lp + utop - 1 - d0 - r;\n"
+            "                    kw = ",
+            "                if (S - 1 - d0 - r >= lp) {\n"
+            "                    const int key = S - 1 - d0 - r;\n"
+            "                    kw = ",
+        ),
+        (
+            "            for (int c = tid; c < BK * D; c += NT) {\n",
+            "            for (int c = tid; c < (BK + L - 1) * D; c += NT) {\n",
+        ),
+        (
+            "                if (d0 + r < d_end && d0 + r >= e_lo) {\n"
+            "                    const int key = lp + utop - 1 - d0 - r;\n"
+            "                    kv = ",
+            "                if (S - 1 - d0 - r >= lp) {\n"
+            "                    const int key = S - 1 - d0 - r;\n"
+            "                    kv = ",
+        ),
+        ("        if (int(sg) * 8 >= G) {\n", "        if (int(sg) >= L) {\n"),
+        (
+            "                simdgroup_load(Kt, Ks + db * 8 * LDK + kb * 8, LDK);\n",
+            "                simdgroup_load(Kt, Ks + db * 8 * LDK + kb * 8 + lag, LDK);\n",
+        ),
+        (
+            "                simdgroup_load(Vm, Vs + kb * 8 * LDV + db * 8, LDV);\n",
+            "                simdgroup_load(Vm, Vs + (kb * 8 + lag) * LDV + db * 8, LDV);\n",
+        ),
+    ]
+    for old, new in edits:
+        if src.count(old) != 1:
+            raise RuntimeError(f"windowed verify kernel: anchor not found once: {old[:60]!r}")
+        src = src.replace(old, new)
+    return src
+
+
+_decode_window_rows_part = None
 _decode_q8_rows_part = None
 _decode_rows_part = None
 # Off: OMLX_INKLING_Q8_SHARED=0 (verify blocks re-stage tiles per position).
 _Q8_SHARED_TILES = os.environ.get("OMLX_INKLING_Q8_SHARED", "1") != "0"
 # Simdgroups of 8 (position, head) rows per threadgroup (1024 threads max).
 _Q8_MAX_ROW_GROUPS = 32
+# Positions of a windowed verify block (staged tile steps hold BK + 7 keys).
+_WINDOW_ROWS_MAX = 8
 
 
 def q8_decode_supported(q, k_state, kv) -> bool:
