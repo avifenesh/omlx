@@ -245,6 +245,34 @@ def trim(state, count: int) -> bool:
     return True
 
 
+def trim_rows(state, counts) -> bool:
+    """``trim`` by ``counts[b]`` keys in row ``b``. A row that drops more than
+    the fewest moves right by the difference behind more left padding, so
+    every row still ends at the newest column."""
+    common = min(counts)
+    if not trim(state, common):
+        return False
+    buffer = _buffer(state)
+    start = _floor_tile(buffer.n - (state.window - 1))
+    state.cache[KEYS] = state.cache[VALUES] = buffer.view = None
+    moves = []
+    for row, count in enumerate(counts):
+        shift = count - common
+        if not shift:
+            continue
+        lo = max(buffer.pads[row] + shift, start)
+        for data in (buffer.keys, buffer.values):
+            moved = data[row : row + 1, :, lo - shift : buffer.n - shift] * 1
+            moves.append((data, row, lo, moved))
+        buffer.pads[row] += shift
+    # The copies run first and let go of the buffers, so the writes are in place.
+    mx.async_eval([moved for *_, moved in moves])
+    for data, row, lo, moved in moves:
+        data[row : row + 1, :, lo : buffer.n] = moved
+    _publish(state, buffer)
+    return True
+
+
 def newest(state, count: int):
     """The ``count`` newest keys and values, e.g. the chunk just appended."""
     buffer = _buffer(state)

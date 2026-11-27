@@ -1466,6 +1466,16 @@ def gqa_flash_decode_attention(q, k, v, rel, sink, *, scale, window, left_paddin
     )[0]
 
 
+def _row_end_source(src: str) -> str:
+    """A q8 part kernel source whose rows end at their own written column,
+    read from ``dims`` after the left padding of every row."""
+    old = "    const int S = dims[1];\n"
+    if src.count(old) != 1:
+        raise RuntimeError("q8 kernel: row end anchor not found once")
+    new = "    const int S = dims[3 + int(threadgroups_per_grid.z) + b];\n"
+    return src.replace(old, new)
+
+
 # The decode kernel over an 8-bit affine cache (OMLX_INKLING_KV8): the same
 # kernel with K and V staged from int8 codes (four per uint32, low byte first,
 # sign-extended) times one scale per vector, instead of a BF16 copy of the
@@ -1540,7 +1550,7 @@ def _q8_part_source() -> str:
             }
         }
 """
-    return src[:head] + staging + src[tail:]
+    return _row_end_source(src[:head] + staging + src[tail:])
 
 
 _decode_q8_part = None
@@ -1904,19 +1914,19 @@ def q8_decode_supported(q, k_state, kv) -> bool:
         and mx.default_device() == mx.gpu
         and 80 * q.shape[-1] + 256 <= 32768
         and q.shape[1] % indices.shape[1] == 0
-        and getattr(kv, "_row_ends", None) is None
     )
 
 
 def gqa_flash_decode_attention_q8(
-    q, k_state, v_state, rel, sink, *, scale, window, left_padding=None
+    q, k_state, v_state, rel, sink, *, scale, window, left_padding=None, row_ends=None
 ):
     """``gqa_flash_decode_attention`` reading an 8-bit affine cache in place.
 
     ``q`` is already in the key rotation; ``k_state``/``v_state`` hold
     ``indices`` [B, Hkv, S, D/4] uint32 and ``norms`` [B, Hkv, S] scales; the
     output is in the value rotation. S is the cached length the caller passes
-    through the state's ``shape``.
+    through the state's ``shape``; ``row_ends`` lists each row's own written
+    end when rows stop short of S.
     """
     global _decode_q8_part, _decode_q8_rows_part, _decode_q8_nax_part, _decode_kernels
     b, hq, length, d = q.shape
@@ -1954,9 +1964,10 @@ def gqa_flash_decode_attention_q8(
         )
     chunk = _DECODE_SLIDING_CHUNK if window else _DECODE_CHUNK
     ns = _decode_chunks(s, window, chunk)
-    dims = mx.array([length, s, ns] + [0] * b, dtype=mx.int32)
+    ends = [s] * b if row_ends is None else [int(e) for e in row_ends]
+    dims = mx.array([length, s, ns] + [0] * b + ends, dtype=mx.int32)
     if left_padding is not None:
-        dims = mx.concatenate([dims[:3], left_padding.astype(mx.int32)])
+        dims = mx.concatenate([dims[:3], left_padding.astype(mx.int32), dims[3 + b :]])
     inputs = [
         q, k_idx, v_idx, k_sc, v_sc, mx.contiguous(rel), dims,
         mx.array([scale], dtype=mx.float32),
@@ -1970,7 +1981,7 @@ def gqa_flash_decode_attention_q8(
                 input_names=["q", "k", "v", "ks", "vs", "rel", "dims", "scale"],
                 output_names=["part_o", "part_m", "part_l"],
                 header=_MPP_HEADER,
-                source=_Q8_NAX_PART_SOURCE,
+                source=_row_end_source(_Q8_NAX_PART_SOURCE),
                 ensure_row_contiguous=False,
             )
         nf = -(-(length * g) // 16)

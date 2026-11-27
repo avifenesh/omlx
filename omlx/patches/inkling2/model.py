@@ -876,6 +876,7 @@ class Inkling2Attention(nn.Module):
                     out = kernels.gqa_flash_decode_attention_q8(
                         q, k, v, rel, sink, scale=self.scale, window=self.window,
                         left_padding=left_padding,
+                        row_ends=getattr(kv, "_row_ends", None),
                     )
                     return kv.value_codec._rotate_inverse(out).astype(dtype)
                 k = kv.key_codec.dequantize_rotated(k, dtype)
@@ -1530,11 +1531,11 @@ class Model(nn.Module):
             )
         return SimpleNamespace(logits=logits, hidden_states=captures)
 
-    # Rows that accept different counts would need a ragged rollback: the
-    # attention kernels mask left padding only, and the relative bias band
-    # assumes every row ends at the same column. A batched verify instead cuts
-    # every row to the fewest accepted drafts (fused_batch._clamp_to_shared_accept),
-    # so each rollback trims all rows by one count. Off: OMLX_INKLING_BATCH_SPEC=0.
+    # Rows of a batched verify keep their own accepted drafts when every
+    # full-attention cache trims rows alone (the 8-bit affine cache, read by
+    # the q8 kernels at each row's end); over dense caches every row is cut to
+    # the fewest accepted drafts (fused_batch._clamp_to_shared_accept).
+    # Off: OMLX_INKLING_BATCH_SPEC=0.
     _omlx_drafter_single_row = os.environ.get("OMLX_INKLING_BATCH_SPEC", "1") == "0"
     _omlx_mtp_uniform_accept = True
 
@@ -1566,6 +1567,37 @@ class Model(nn.Module):
             cache[-1][0] = cache[-1]._omlx_verify_xp[:, keep - 1 : keep]
         return True
 
+    def _rollback_rows(self, cache, accepted: list[int], num_drafts: int) -> bool:
+        """``mtp_partial_rollback`` with one accepted count per row."""
+        visits = self.model.visit_caches(cache)
+        if any(
+            getattr(conv, "_omlx_verify_xp", None) is None
+            or (kv is not None and not getattr(type(kv), "_omlx_ragged_trim", False))
+            for kv, conv in visits
+        ):
+            return False
+        counts = [int(num_drafts) - a for a in accepted]
+        keep = mx.array(accepted)[:, None] + 1
+        width = self.args.text.sconv_kernel_size - 1
+        cut = (keep + mx.arange(width))[:, :, None]
+        for kv, conv in visits:
+            if kv is None:
+                if not windows.trim_rows(conv, counts):
+                    return False
+            elif not kv.__dict__.get("is_speculating", False):
+                kv.trim_rows(counts)
+            if kv is not None and not _Q8_DECODE:
+                # Only the q8 kernels read rows that end at different columns.
+                kv._align_row_ends()
+            base = windows.CONV if kv is None else 0
+            for slot, xp in conv._omlx_verify_xp.items():
+                conv[base + slot] = mx.take_along_axis(xp, cut, axis=1)
+            conv._omlx_verify_xp = None
+        if self.model._caches_thinking_flags:
+            flags = cache[-1]._omlx_verify_xp
+            cache[-1][0] = mx.take_along_axis(flags, keep - 1, axis=1)
+        return True
+
     def extract_verify_row(self, cache, index: int) -> list:
         """Row ``index`` of a batched cache right after a verify forward, with
         its conv verify windows, so ``mtp_partial_rollback`` can roll it back
@@ -1583,10 +1615,14 @@ class Model(nn.Module):
 
     def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
         if isinstance(accepted, (list, tuple)):
-            counts = {int(a) for a in accepted}
-            if len(counts) != 1:
-                raise RuntimeError("Inkling 2 rolls every batch row back by one count")
-            accepted = counts.pop()
+            counts = [int(a) for a in accepted]
+            if len(set(counts)) > 1:
+                if not self._rollback_rows(caches, counts, int(block_size) - 1):
+                    raise RuntimeError(
+                        "Inkling 2 rows of these caches roll back by one count"
+                    )
+                return counts
+            accepted = counts[0]
         accepted = int(accepted)
         if not self.mtp_partial_rollback(caches, accepted, int(block_size) - 1):
             raise RuntimeError("Inkling 2 verify rollback found no conv windows")

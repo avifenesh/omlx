@@ -177,7 +177,8 @@ def _ragged_trim_rows(cache, accepted, depth):
 
 
 def _uniform_accept(model):
-    """Backbones whose caches roll every row back by one count (no ragged trim)."""
+    """Backbones that roll every row back by one count unless every KV cache
+    trims rows alone (``_rows_trim_alone``)."""
     return any(
         getattr(host, "_omlx_mtp_uniform_accept", False) is True
         for host in (
@@ -186,6 +187,18 @@ def _uniform_accept(model):
             getattr(model, "_language_model", None),
         )
         if host is not None
+    )
+
+
+def _rows_trim_alone(caches) -> bool:
+    """Whether every KV cache trims each row by its own count; the model's
+    rollback cuts its array states per row."""
+    arrays = (ArraysCache,)
+    if vlm_cache is not None:
+        arrays += (vlm_cache.ArraysCache,)
+    return all(
+        getattr(type(leaf), "_omlx_ragged_trim", False) or isinstance(leaf, arrays)
+        for leaf in _cache_leaves(caches)
     )
 
 
@@ -454,7 +467,8 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
     else:
         mx.eval(logits, hidden)
     uniform = _uniform_accept(batch.model)
-    if uniform:
+    shared_accept = uniform and not _rows_trim_alone(cache)
+    if shared_accept:
         _clamp_to_shared_accept(greedy_results, stochastic_results, depth)
     verify_ms = (time.perf_counter() - started) * 1000 / len(rows)
     vector_rollback = isinstance(gdn, SpeculativeCacheTransaction) or (
@@ -536,7 +550,7 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
         # place. No extraction or merge is needed for the next target call.
         started = time.perf_counter()
         accepted_rows = [accepted for accepted, _ in deferred]
-        if split is not None and len(set(accepted_rows)) > 1:
+        if shared_accept and len(set(accepted_rows)) > 1:
             # A row lowered its own count after the shared clamp (stop sequence,
             # token limit, boundary): roll each row back alone; the batch is
             # rebuilt from the rows.
