@@ -1656,6 +1656,236 @@ _Q8_MAX_ROW_GROUPS = 32
 _WINDOW_ROWS_MAX = 8
 
 
+_MPP_HEADER = """
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace mpp::tensor_ops;
+"""
+
+# The q8 part kernel on the tensor units (D = 128, full-attention rows), for
+# decode and verify alike: one simdgroup per 16 (position, head) rows, 32-key
+# tiles at the same absolute key positions as _DECODE_PART_SOURCE. A lane's 4
+# fragment columns are one code word; the key scale multiplies the score and
+# the value scale P, so tiles enter matmul2d as raw codes.
+_Q8_NAX_PART_SOURCE = """
+    constexpr int BK = 32;
+    constexpr float LOG2E = 1.4426950408889634f;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const int chunk = threadgroup_position_in_grid.x;
+    const int hk = threadgroup_position_in_grid.y;
+    const int b = threadgroup_position_in_grid.z;
+    const int L = dims[0];
+    const int S = dims[1];
+    const int NS = dims[2];
+    const int lp = dims[3 + b];
+    const short qid = short(lane >> 2);
+    const short fm = short((qid & 4) | ((lane >> 1) & 3));
+    const short fn = short(((qid & 2) | (lane & 1)) * 4);
+    const float qscale = scale[0] * LOG2E;
+    const int utop = ((max(S - 1 - lp, 0)) / CHUNK + 1) * CHUNK;
+    const int e_lo = utop - (S - lp);
+    const int d_begin = chunk * CHUNK;
+    const int d_end = min(d_begin + CHUNK, utop);
+
+    bool rok[2];
+    int rpos[2];
+    int rh[2];
+    int shift[2];
+    const device T* relp[2];
+    for (short i = 0; i < 2; ++i) {
+        const int rr = int(sg) * 16 + fm + i * 8;
+        rok[i] = rr < L * G;
+        rpos[i] = rok[i] ? rr / G : 0;
+        rh[i] = hk * G + (rok[i] ? rr % G : 0);
+        shift[i] = rok[i] ? utop - 1 - (S - L + rpos[i] - lp) : (1 << 30);
+        relp[i] = rel + ((size_t)(b * L + rpos[i]) * HQ + rh[i]) * R;
+    }
+
+    constexpr int LDQ = D + 8;
+    threadgroup half Qs[NF * 16 * LDQ];
+    {
+        threadgroup half* qd = Qs + int(sg) * 16 * LDQ;
+        for (int c = lane; c < 16 * D; c += 32) {
+            const int r = c / D;
+            const int col = c % D;
+            const int rr = int(sg) * 16 + r;
+            float qv = 0.0f;
+            if (rr < L * G) {
+                qv = float(q[b * q_strides[0] + (hk * G + rr % G) * q_strides[1]
+                             + (rr / G) * q_strides[2] + col * q_strides[3]]);
+            }
+            qd[r * LDQ + col] = half(qv);
+        }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    const threadgroup half* q0 = Qs + (int(sg) * 16 + fm) * LDQ + fn;
+    const threadgroup half* q1 = q0 + 8 * LDQ;
+
+    constexpr auto qk_desc = matmul2d_descriptor(
+        16, 32, 16, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<qk_desc, execution_simdgroup> qk_op;
+    constexpr auto pv_desc = matmul2d_descriptor(
+        16, 32, 16, false, false, true, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<pv_desc, execution_simdgroup> pv_op;
+    auto pa = pv_op.template get_left_input_cooperative_tensor<half, half, float>();
+    auto pb = pv_op.template get_right_input_cooperative_tensor<half, half, float>();
+    using PA = metal::remove_addrspace_t<decltype(pa)>;
+    using PB = metal::remove_addrspace_t<decltype(pb)>;
+    auto o0 = pv_op.template get_destination_cooperative_tensor<PA, PB, float>();
+    auto o1 = pv_op.template get_destination_cooperative_tensor<PA, PB, float>();
+    auto o2 = pv_op.template get_destination_cooperative_tensor<PA, PB, float>();
+    auto o3 = pv_op.template get_destination_cooperative_tensor<PA, PB, float>();
+    for (short e = 0; e < 16; ++e) {
+        o0[e] = 0.0f; o1[e] = 0.0f; o2[e] = 0.0f; o3[e] = 0.0f;
+    }
+    auto qa = qk_op.template get_left_input_cooperative_tensor<half, half, float>();
+    auto kb = qk_op.template get_right_input_cooperative_tensor<half, half, float>();
+    using QA = metal::remove_addrspace_t<decltype(qa)>;
+    using KB = metal::remove_addrspace_t<decltype(kb)>;
+    auto sc = qk_op.template get_destination_cooperative_tensor<QA, KB, float>();
+
+    float m_run[2] = {-INFINITY, -INFINITY};
+    float l_run[2] = {0.0f, 0.0f};
+    const device uint* kb_ptr = k + b * k_strides[0] + hk * k_strides[1];
+    const device uint* vb_ptr = v + b * v_strides[0] + hk * v_strides[1];
+    const device SC* ksb = ks + b * ks_strides[0] + hk * ks_strides[1];
+    const device SC* vsb = vs + b * vs_strides[0] + hk * vs_strides[1];
+    const int kw = k_strides[3];
+    const int vw = v_strides[3];
+    const int top = lp + utop - 1;
+    const bool sg_live = int(sg) * 16 < L * G;
+
+    for (int d0 = d_begin; d0 < d_end && sg_live; d0 += BK) {
+        const device uint* kr[2][2];
+        for (short tn = 0; tn < 2; ++tn) {
+            for (short i = 0; i < 2; ++i) {
+                const int key = clamp(top - d0 - (tn * 16 + fm + i * 8), 0, S - 1);
+                kr[tn][i] = kb_ptr + key * k_strides[2] + (fn / 4) * kw;
+            }
+        }
+        for (short e = 0; e < 16; ++e) {
+            sc[e] = 0.0f;
+        }
+        #pragma clang loop unroll(full)
+        for (short kk = 0; kk < D / 16; ++kk) {
+            const half4 qv0 = *(const threadgroup half4*)(q0 + kk * 16);
+            const half4 qv1 = *(const threadgroup half4*)(q1 + kk * 16);
+            for (short j = 0; j < 4; ++j) {
+                qa[j] = qv0[j];
+                qa[4 + j] = qv1[j];
+            }
+            for (short tn = 0; tn < 2; ++tn) {
+                for (short i = 0; i < 2; ++i) {
+                    const half4 kv4 = half4(as_type<char4>(kr[tn][i][kk * 4 * kw]));
+                    for (short j = 0; j < 4; ++j) {
+                        kb[tn * 8 + i * 4 + j] = kv4[j];
+                    }
+                }
+            }
+            qk_op.run(qa, kb, sc);
+        }
+
+        float s[2][2][4];
+        bool ok[2][2][4];
+        float vsc[2][4];
+        float rmax[2] = {-INFINITY, -INFINITY};
+        for (short tn = 0; tn < 2; ++tn) {
+            for (short j = 0; j < 4; ++j) {
+                const int dd = d0 + tn * 16 + fn + j;
+                const bool kvalid = dd < d_end && dd >= e_lo;
+                const int key = clamp(top - dd, 0, S - 1);
+                const float ksc = float(ksb[key * ks_strides[2]]) * qscale;
+                vsc[tn][j] = kvalid ? float(vsb[key * vs_strides[2]]) : 0.0f;
+                for (short i = 0; i < 2; ++i) {
+                    const int d = dd - shift[i];
+                    float x = float(sc[tn * 8 + i * 4 + j]) * ksc;
+                    if (d >= 0 && d < R) {
+                        x += float(relp[i][d]) * LOG2E;
+                    }
+                    const bool vis = kvalid && d >= 0;
+                    s[tn][i][j] = x;
+                    ok[tn][i][j] = vis;
+                    rmax[i] = vis ? max(rmax[i], x) : rmax[i];
+                }
+            }
+        }
+        float factor[2];
+        float mnew[2];
+        float rs[2] = {0.0f, 0.0f};
+        for (short i = 0; i < 2; ++i) {
+            rmax[i] = max(rmax[i], simd_shuffle_xor(rmax[i], ushort(1)));
+            rmax[i] = max(rmax[i], simd_shuffle_xor(rmax[i], ushort(8)));
+            mnew[i] = max(m_run[i], rmax[i]);
+            factor[i] = m_run[i] == -INFINITY ? 0.0f : exp2(m_run[i] - mnew[i]);
+            m_run[i] = mnew[i];
+        }
+        if (!simd_all(factor[0] == 1.0f && factor[1] == 1.0f)) {
+            for (short e = 0; e < 16; ++e) {
+                const float f = factor[(e >> 2) & 1];
+                o0[e] *= f; o1[e] *= f; o2[e] *= f; o3[e] *= f;
+            }
+        }
+
+        for (short ks16 = 0; ks16 < 2; ++ks16) {
+            for (short i = 0; i < 2; ++i) {
+                for (short j = 0; j < 4; ++j) {
+                    const float p = ok[ks16][i][j] ? exp2(s[ks16][i][j] - mnew[i]) : 0.0f;
+                    rs[i] += p;
+                    pa[i * 4 + j] = half(p * vsc[ks16][j]);
+                }
+            }
+            const int key0 = clamp(top - d0 - (ks16 * 16 + fm), 0, S - 1);
+            const int key1 = clamp(top - d0 - (ks16 * 16 + fm + 8), 0, S - 1);
+            const device uint* v0 = vb_ptr + key0 * v_strides[2] + (fn / 4) * vw;
+            const device uint* v1 = vb_ptr + key1 * v_strides[2] + (fn / 4) * vw;
+            #pragma clang loop unroll(full)
+            for (short np = 0; np < 4; ++np) {
+                for (short tn = 0; tn < 2; ++tn) {
+                    const half4 a = half4(as_type<char4>(v0[((np * 32 + tn * 16) / 4) * vw]));
+                    const half4 c = half4(as_type<char4>(v1[((np * 32 + tn * 16) / 4) * vw]));
+                    for (short j = 0; j < 4; ++j) {
+                        pb[tn * 8 + j] = a[j];
+                        pb[tn * 8 + 4 + j] = c[j];
+                    }
+                }
+                if (np == 0) pv_op.run(pa, pb, o0);
+                else if (np == 1) pv_op.run(pa, pb, o1);
+                else if (np == 2) pv_op.run(pa, pb, o2);
+                else pv_op.run(pa, pb, o3);
+            }
+        }
+        for (short i = 0; i < 2; ++i) {
+            rs[i] += simd_shuffle_xor(rs[i], ushort(1));
+            rs[i] += simd_shuffle_xor(rs[i], ushort(8));
+            l_run[i] = l_run[i] * factor[i] + rs[i];
+        }
+    }
+
+    for (short i = 0; i < 2; ++i) {
+        if (!rok[i]) {
+            continue;
+        }
+        // A chunk past the row's keys leaves l == 0 and the fold skips it.
+        const size_t slot = (((size_t)b * HQ + rh[i]) * L + rpos[i]) * NS + chunk;
+        if (fn == 0) {
+            part_m[slot] = m_run[i] == -INFINITY ? 0.0f : m_run[i];
+            part_l[slot] = l_run[i];
+        }
+        device float* op = part_o + slot * D + fn;
+        for (short tn = 0; tn < 2; ++tn) {
+            for (short j = 0; j < 4; ++j) {
+                const short e = tn * 8 + i * 4 + j;
+                op[tn * 16 + j] = o0[e];
+                op[32 + tn * 16 + j] = o1[e];
+                op[64 + tn * 16 + j] = o2[e];
+                op[96 + tn * 16 + j] = o3[e];
+            }
+        }
+    }
+"""
+_decode_q8_nax_part = None
+
+
 def q8_decode_supported(q, k_state, kv) -> bool:
     """Decode-sized blocks over an 8-bit affine cache the q8 kernel can read."""
     indices = getattr(k_state, "indices", None)
@@ -1688,7 +1918,7 @@ def gqa_flash_decode_attention_q8(
     output is in the value rotation. S is the cached length the caller passes
     through the state's ``shape``.
     """
-    global _decode_q8_part, _decode_q8_rows_part, _decode_kernels
+    global _decode_q8_part, _decode_q8_rows_part, _decode_q8_nax_part, _decode_kernels
     b, hq, length, d = q.shape
     k_idx, v_idx = k_state.indices, v_state.indices
     k_sc, v_sc = k_state.norms, v_state.norms
@@ -1724,18 +1954,38 @@ def gqa_flash_decode_attention_q8(
         )
     chunk = _DECODE_SLIDING_CHUNK if window else _DECODE_CHUNK
     ns = _decode_chunks(s, window, chunk)
-    rows = length * g if shared else g
-    nsg = max(-(-rows // 8), _DECODE_STAGERS)
     dims = mx.array([length, s, ns] + [0] * b, dtype=mx.int32)
     if left_padding is not None:
         dims = mx.concatenate([dims[:3], left_padding.astype(mx.int32)])
-    kernel = _decode_q8_rows_part if shared else _decode_q8_part
-    part_o, part_m, part_l = kernel(
-        inputs=[
-            q, k_idx, v_idx, k_sc, v_sc, mx.contiguous(rel), dims,
-            mx.array([scale], dtype=mx.float32),
-        ],
-        template=[
+    inputs = [
+        q, k_idx, v_idx, k_sc, v_sc, mx.contiguous(rel), dims,
+        mx.array([scale], dtype=mx.float32),
+    ]
+    # Q of up to 7 16-row fragments fits the 32 KB of threadgroup memory.
+    nax = not window and d == 128 and length * g <= 7 * 16 and (length == 1 or shared)
+    if nax and is_nax_available():
+        if _decode_q8_nax_part is None:
+            _decode_q8_nax_part = mx.fast.metal_kernel(
+                name="omlx_inkling2_flash_decode_part_q8_nax",
+                input_names=["q", "k", "v", "ks", "vs", "rel", "dims", "scale"],
+                output_names=["part_o", "part_m", "part_l"],
+                header=_MPP_HEADER,
+                source=_Q8_NAX_PART_SOURCE,
+                ensure_row_contiguous=False,
+            )
+        nf = -(-(length * g) // 16)
+        kernel = _decode_q8_nax_part
+        template = [
+            ("T", q.dtype), ("SC", k_sc.dtype), ("D", d), ("HQ", hq), ("G", g),
+            ("R", rel.shape[-1]), ("CHUNK", chunk), ("NF", nf),
+        ]
+        grid = (ns * nf * 32, hkv, b)
+        threadgroup = (nf * 32, 1, 1)
+    else:
+        rows = length * g if shared else g
+        nsg = max(-(-rows // 8), _DECODE_STAGERS)
+        kernel = _decode_q8_rows_part if shared else _decode_q8_part
+        template = [
             ("T", q.dtype),
             ("SC", k_sc.dtype),
             ("IS_BF16", q.dtype == mx.bfloat16),
@@ -1746,9 +1996,14 @@ def gqa_flash_decode_attention_q8(
             ("WINDOW", int(window)),
             ("CHUNK", chunk),
             ("NSG", nsg),
-        ],
-        grid=(ns * nsg * 32, hkv * (1 if shared else length), b),
-        threadgroup=(nsg * 32, 1, 1),
+        ]
+        grid = (ns * nsg * 32, hkv * (1 if shared else length), b)
+        threadgroup = (nsg * 32, 1, 1)
+    part_o, part_m, part_l = kernel(
+        inputs=inputs,
+        template=template,
+        grid=grid,
+        threadgroup=threadgroup,
         output_shapes=[
             (b, hq, length, ns, d),
             (b, hq, length, ns),
