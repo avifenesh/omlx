@@ -618,8 +618,9 @@ def _mix_messages_normed(
     if norm_w is None or not kernels.loop_messages_supported(mixed, messages):
         return None
     hidden = mixed.shape[-1]
-    rows = mixed.shape[0] * mixed.shape[1]
-    if bf16_weights is not None and rows <= _COMPILED_MAX_TOKENS:
+    # Per-row kernels for decode and verify rows: the matmuls below switch
+    # kernels with the row count, so a verify would round apart from decode.
+    if bf16_weights is not None and mixed.shape[1] <= _COMPILED_MAX_TOKENS:
         down_t, gf_t = bf16_weights
         low = kernels.loop_message_down_bf16(mixed, messages, down_t, m0)
         gates = kernels.loop_message_gates_bf16(low, gf_t)

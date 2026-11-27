@@ -552,123 +552,164 @@ _LOOP_OUT_SOURCE = """
 # weights are BF16 widened to FP32 at load, so streaming them as BF16 halves
 # controller traffic while keeping FP32 accumulation and one BF16 round.
 # Fusing unit-RMS normalization into the down projection eliminates the
-# separate loop_message_inputs launch and intermediate z buffer, while running
-# one 128-thread threadgroup per (rank, controlled input, row) keeps all GPU
-# cores busy even when n == 1.
+# separate loop_message_inputs launch and intermediate z buffer.
 # Unlike the kernels above, these two do not repeat MLX's reduction order, so
-# their bits differ from the FP32 matmul path. Each row runs on its own, so
-# verify rows keep the bits of serial decode.
+# their bits differ from the FP32 matmul path. A threadgroup serves RB rows
+# (and RPT ranks) with each row's sums in the same order whatever RB and RPT
+# are, so every row has the bits of its serial decode step.
 _LOOP_DOWN_BF16_SOURCE = """
     constexpr uint VECS = H / 4;
     constexpr uint STEPS = (VECS + 127) / 128;
     const uint tid = thread_position_in_threadgroup.x;
     const uint sg = tid / 32;
     const uint lane = tid % 32;
-    const uint r = threadgroup_position_in_grid.x;
+    const uint r0 = threadgroup_position_in_grid.x * RPT;
     const uint i = threadgroup_position_in_grid.y;
-    const uint row = threadgroup_position_in_grid.z;
+    const uint row0 = threadgroup_position_in_grid.z * RB;
     const uint rows = (uint)x_shape[0] * (uint)x_shape[1];
     const uint qx = (uint)x_shape[2];
+    const uint nb = min(uint(RB), rows - row0);
 
-    const device float4* xp = (const device float4*)(
-        x + ((size_t)row * qx + (XQ ? i : 0)) * H);
-    const device float4* mp = (const device float4*)(
-        m + ((size_t)row * 4 + M0 + i) * H);
-    const device uint2* dxp = (const device uint2*)(
-        down_t + (((size_t)i * 2 + 0) * R + r) * H);
-    const device uint2* dmp = (const device uint2*)(
-        down_t + (((size_t)i * 2 + 1) * R + r) * H);
+    const device float4* xp[RB];
+    const device float4* mp[RB];
+    threadgroup float sgs[RB * 8];
+    #pragma clang loop unroll(full)
+    for (uint j = 0; j < RB; ++j) {
+        const uint row = row0 + min(j, nb - 1);
+        xp[j] = (const device float4*)(x + ((size_t)row * qx + (XQ ? i : 0)) * H);
+        mp[j] = (const device float4*)(m + ((size_t)row * 4 + M0 + i) * H);
+        float ax = 0.0f;
+        float am = 0.0f;
+        for (uint s = 0; s < STEPS; ++s) {
+            uint idx = s * 128 + tid;
+            if (idx < VECS) {
+                float4 xw = xp[j][idx];
+                float4 mw = mp[j][idx];
+                ax = fma(xw.x, xw.x, fma(xw.y, xw.y, fma(xw.z, xw.z, fma(xw.w, xw.w, ax))));
+                am = fma(mw.x, mw.x, fma(mw.y, mw.y, fma(mw.z, mw.z, fma(mw.w, mw.w, am))));
+            }
+        }
+        float sx = simd_sum(ax);
+        float sm = simd_sum(am);
+        if (lane == 0) {
+            sgs[j * 8 + sg] = sx;
+            sgs[j * 8 + 4 + sg] = sm;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_x[RB];
+    float inv_m[RB];
+    #pragma clang loop unroll(full)
+    for (uint j = 0; j < RB; ++j) {
+        const threadgroup float* q = sgs + j * 8;
+        inv_x[j] = metal::rsqrt((q[0] + q[1] + q[2] + q[3]) / float(H) + 1e-6f);
+        inv_m[j] = metal::rsqrt((q[4] + q[5] + q[6] + q[7]) / float(H) + 1e-6f);
+    }
 
-    float4 xv[STEPS];
-    float4 mv[STEPS];
-    float ax = 0.0f;
-    float am = 0.0f;
+    // acc[j][k]: row j, rank k; each sums its products in the order of s.
+    float acc[RB][RPT];
+    #pragma clang loop unroll(full)
+    for (uint j = 0; j < RB; ++j) {
+        #pragma clang loop unroll(full)
+        for (uint k = 0; k < RPT; ++k) {
+            acc[j][k] = 0.0f;
+        }
+    }
     for (uint s = 0; s < STEPS; ++s) {
         uint idx = s * 128 + tid;
         if (idx < VECS) {
-            float4 xw = xp[idx];
-            float4 mw = mp[idx];
-            xv[s] = xw;
-            mv[s] = mw;
-            ax = fma(xw.x, xw.x, fma(xw.y, xw.y, fma(xw.z, xw.z, fma(xw.w, xw.w, ax))));
-            am = fma(mw.x, mw.x, fma(mw.y, mw.y, fma(mw.z, mw.z, fma(mw.w, mw.w, am))));
+            float4 xn[RB];
+            float4 mn[RB];
+            #pragma clang loop unroll(full)
+            for (uint j = 0; j < RB; ++j) {
+                float4 xw = xp[j][idx];
+                float4 mw = mp[j][idx];
+                xn[j] = float4(float(bfloat16_t(xw.x * inv_x[j])), float(bfloat16_t(xw.y * inv_x[j])),
+                               float(bfloat16_t(xw.z * inv_x[j])), float(bfloat16_t(xw.w * inv_x[j])));
+                mn[j] = float4(float(bfloat16_t(mw.x * inv_m[j])), float(bfloat16_t(mw.y * inv_m[j])),
+                               float(bfloat16_t(mw.z * inv_m[j])), float(bfloat16_t(mw.w * inv_m[j])));
+            }
+            #pragma clang loop unroll(full)
+            for (uint k = 0; k < RPT; ++k) {
+                const size_t r = r0 + k;
+                uint2 dx = ((const device uint2*)(down_t + (((size_t)i * 2 + 0) * R + r) * H))[idx];
+                uint2 dm = ((const device uint2*)(down_t + (((size_t)i * 2 + 1) * R + r) * H))[idx];
+                #pragma clang loop unroll(full)
+                for (uint j = 0; j < RB; ++j) {
+                    float a = acc[j][k];
+                    a = fma(xn[j].x, as_type<float>(dx.x << 16), a);
+                    a = fma(xn[j].y, as_type<float>(dx.x & 0xFFFF0000u), a);
+                    a = fma(xn[j].z, as_type<float>(dx.y << 16), a);
+                    a = fma(xn[j].w, as_type<float>(dx.y & 0xFFFF0000u), a);
+                    a = fma(mn[j].x, as_type<float>(dm.x << 16), a);
+                    a = fma(mn[j].y, as_type<float>(dm.x & 0xFFFF0000u), a);
+                    a = fma(mn[j].z, as_type<float>(dm.y << 16), a);
+                    a = fma(mn[j].w, as_type<float>(dm.y & 0xFFFF0000u), a);
+                    acc[j][k] = a;
+                }
+            }
         }
     }
-    threadgroup float sgs[8];
-    threadgroup float sgs_a[4];
-    float sx = simd_sum(ax);
-    float sm = simd_sum(am);
-    if (lane == 0) {
-        sgs[sg] = sx;
-        sgs[4 + sg] = sm;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float inv_x = metal::rsqrt((sgs[0] + sgs[1] + sgs[2] + sgs[3]) / float(H) + 1e-6f);
-    const float inv_m = metal::rsqrt((sgs[4] + sgs[5] + sgs[6] + sgs[7]) / float(H) + 1e-6f);
-
-    float acc = 0.0f;
-    for (uint s = 0; s < STEPS; ++s) {
-        uint idx = s * 128 + tid;
-        if (idx < VECS) {
-            float4 xw = xv[s];
-            float4 mw = mv[s];
-            uint2 dx = dxp[idx];
-            uint2 dm = dmp[idx];
-            acc = fma(float(bfloat16_t(xw.x * inv_x)), as_type<float>(dx.x << 16), acc);
-            acc = fma(float(bfloat16_t(xw.y * inv_x)), as_type<float>(dx.x & 0xFFFF0000u), acc);
-            acc = fma(float(bfloat16_t(xw.z * inv_x)), as_type<float>(dx.y << 16), acc);
-            acc = fma(float(bfloat16_t(xw.w * inv_x)), as_type<float>(dx.y & 0xFFFF0000u), acc);
-            acc = fma(float(bfloat16_t(mw.x * inv_m)), as_type<float>(dm.x << 16), acc);
-            acc = fma(float(bfloat16_t(mw.y * inv_m)), as_type<float>(dm.x & 0xFFFF0000u), acc);
-            acc = fma(float(bfloat16_t(mw.z * inv_m)), as_type<float>(dm.y << 16), acc);
-            acc = fma(float(bfloat16_t(mw.w * inv_m)), as_type<float>(dm.y & 0xFFFF0000u), acc);
+    threadgroup float sgs_a[RB * RPT * 4];
+    #pragma clang loop unroll(full)
+    for (uint j = 0; j < RB; ++j) {
+        #pragma clang loop unroll(full)
+        for (uint k = 0; k < RPT; ++k) {
+            float sa = simd_sum(acc[j][k]);
+            if (lane == 0) {
+                sgs_a[(j * RPT + k) * 4 + sg] = sa;
+            }
         }
     }
-    float sa = simd_sum(acc);
-    if (lane == 0) {
-        sgs_a[sg] = sa;
-    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        low[((size_t)i * rows + row) * R + r] = float(
-            bfloat16_t(sgs_a[0] + sgs_a[1] + sgs_a[2] + sgs_a[3]));
+    if (tid < nb * RPT) {
+        const uint j = tid / RPT;
+        const uint k = tid % RPT;
+        const threadgroup float* q = sgs_a + (j * RPT + k) * 4;
+        low[((size_t)i * rows + row0 + j) * R + r0 + k] = float(
+            bfloat16_t(q[0] + q[1] + q[2] + q[3]));
     }
 """
 
 _LOOP_GATES_BF16_SOURCE = """
-    constexpr uint COLS_PER_SG = 4;
     constexpr uint R_WORDS = R / 2;
-    constexpr uint R_STEPS = R / 64;
     const uint rows = low_shape[1];
-    uint sg = simdgroup_index_in_threadgroup;
-    uint lane = thread_index_in_simdgroup;
-    uint h0 = (threadgroup_position_in_grid.x * 4 + sg) * COLS_PER_SG;
-    uint n = threadgroup_position_in_grid.y;
-    uint row = threadgroup_position_in_grid.z;
-    size_t nr = (size_t)n * rows + row;
-    const device uint* gfp = (const device uint*)(gf_t + (size_t)n * H * 2 * R);
-    for (uint c = 0; c < COLS_PER_SG; ++c) {
-        uint h = h0 + c;
-        size_t gbase = (size_t)h * 2 * R_WORDS;
-        float g_acc = 0.0f;
-        float f_acc = 0.0f;
-        for (uint rs = 0; rs < R_STEPS; ++rs) {
-            uint r_idx = rs * 32 + lane;
-            float l0 = low[nr * R + r_idx * 2 + 0];
-            float l1 = low[nr * R + r_idx * 2 + 1];
-            uint g_word = gfp[gbase + r_idx];
-            uint f_word = gfp[gbase + R_WORDS + r_idx];
-            g_acc = fma(l0, as_type<float>(g_word << 16), g_acc);
-            g_acc = fma(l1, as_type<float>(g_word & 0xFFFF0000u), g_acc);
-            f_acc = fma(l0, as_type<float>(f_word << 16), f_acc);
-            f_acc = fma(l1, as_type<float>(f_word & 0xFFFF0000u), f_acc);
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint h = thread_position_in_grid.x;
+    const uint n = threadgroup_position_in_grid.y;
+    const uint row0 = threadgroup_position_in_grid.z * RB;
+    const uint nb = min(uint(RB), rows - row0);
+    threadgroup float lows[RB * R];
+    for (uint e = tid; e < nb * R; e += 256) {
+        lows[e] = low[((size_t)n * rows + row0) * R + e];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (h >= H) {
+        return;
+    }
+    // One thread sums each (row, column) over the ranks in order.
+    const device uint* gp = (const device uint*)(gf_t + ((size_t)n * H + h) * 2 * R);
+    uint gw[R_WORDS];
+    uint fw[R_WORDS];
+    #pragma clang loop unroll(full)
+    for (uint w = 0; w < R_WORDS; ++w) {
+        gw[w] = gp[w];
+        fw[w] = gp[R_WORDS + w];
+    }
+    for (uint j = 0; j < nb; ++j) {
+        const threadgroup float* l = lows + j * R;
+        float g = 0.0f;
+        float f = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint w = 0; w < R_WORDS; ++w) {
+            g = fma(l[2 * w], as_type<float>(gw[w] << 16), g);
+            g = fma(l[2 * w + 1], as_type<float>(gw[w] & 0xFFFF0000u), g);
+            f = fma(l[2 * w], as_type<float>(fw[w] << 16), f);
+            f = fma(l[2 * w + 1], as_type<float>(fw[w] & 0xFFFF0000u), f);
         }
-        g_acc = simd_sum(g_acc);
-        f_acc = simd_sum(f_acc);
-        if (lane == 0) {
-            gates[nr * (2 * H) + h] = g_acc;
-            gates[nr * (2 * H) + H + h] = f_acc;
-        }
+        size_t nr = (size_t)n * rows + row0 + j;
+        gates[nr * (2 * H) + h] = g;
+        gates[nr * (2 * H) + H + h] = f;
     }
 """
 _loop_kernels: dict = {}
@@ -717,6 +758,13 @@ def loop_bf16_supported(hidden: int, rank: int) -> bool:
     )
 
 
+# Rows and ranks per threadgroup of the BF16 controller kernels. They split
+# the work only: a row's sums do not depend on them or on the row count.
+_LOOP_ROWS_PER_GROUP = 4
+_LOOP_RANKS_PER_GROUP = 8
+_LOOP_GATE_ROWS_PER_GROUP = 8
+
+
 def loop_message_down_bf16(
     mixed: mx.array, messages: mx.array, down_t: mx.array, m0: int
 ) -> mx.array:
@@ -725,10 +773,13 @@ def loop_message_down_bf16(
     b, length, qx, hidden = mixed.shape
     rows = b * length
     n, rank = down_t.shape[0], down_t.shape[2]
+    rb, rpt = _LOOP_ROWS_PER_GROUP, _LOOP_RANKS_PER_GROUP
     return _loop_kernel("down_bf16")(
         inputs=[mixed, messages, down_t],
-        template=[("H", hidden), ("R", rank), ("M0", m0), ("XQ", qx > 1)],
-        grid=(rank * 128, n, rows),
+        template=[
+            ("H", hidden), ("R", rank), ("M0", m0), ("XQ", qx > 1), ("RB", rb), ("RPT", rpt)
+        ],
+        grid=(rank // rpt * 128, n, -(-rows // rb)),
         threadgroup=(128, 1, 1),
         output_shapes=[(n, rows, rank)],
         output_dtypes=[mx.float32],
@@ -740,11 +791,12 @@ def loop_message_gates_bf16(low: mx.array, gf_t: mx.array) -> mx.array:
     [n, H, 2, r] to FP32 ``gates`` [n, rows, 2H]."""
     n, rows, rank = low.shape
     hidden = gf_t.shape[1]
+    rb = _LOOP_GATE_ROWS_PER_GROUP
     return _loop_kernel("gates_bf16")(
         inputs=[low, gf_t],
-        template=[("H", hidden), ("R", rank)],
-        grid=((hidden // 16) * 128, n, rows),
-        threadgroup=(128, 1, 1),
+        template=[("H", hidden), ("R", rank), ("RB", rb)],
+        grid=(-(-hidden // 256) * 256, n, -(-rows // rb)),
+        threadgroup=(256, 1, 1),
         output_shapes=[(n, rows, 2 * hidden)],
         output_dtypes=[mx.float32],
     )[0]

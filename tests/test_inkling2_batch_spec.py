@@ -174,7 +174,7 @@ def test_rows_trim_alone_over_the_8bit_cache_only():
 _ACCEPTS = [(5, 1, 3), (0, 7, 2), (7, 0, 4), (2, 6, 7), (3, 3, 0), (6, 2, 5), (1, 4, 7)]
 
 
-def _verify_cycles(model, ids, lengths, tokens, *, realign=False):
+def _verify_cycles(model, ids, lengths, tokens):
     """Logits of each row's kept verify positions, cycle by cycle, then of one
     decode step; rejected drafts open thinking."""
     drafts, vocab = 7, 300
@@ -196,10 +196,6 @@ def _verify_cycles(model, ids, lengths, tokens, *, realign=False):
         with _ragged_trim_rows(cache, accepted, drafts):
             rolled = model.rollback_speculative_cache(cache, None, accepted, drafts + 1)
         assert rolled == accepted
-        if realign:
-            for entry in cache:
-                if getattr(type(entry), "_omlx_ragged_trim", False):
-                    entry._align_row_ends()
         done = [d + a + 1 for d, a in zip(done, accepted)]
         if model.model._caches_thinking_flags:
             history = [
@@ -222,8 +218,7 @@ def test_rows_keep_their_own_accepted_drafts(dims, head_dim, monkeypatch):
     # Batched verify over the 8-bit cache, each row keeping its own accepted
     # drafts across window recuts and the first 1024-key chunk boundary: every
     # kept verify row has the bits of the batch's greedy decode step for its
-    # token. The loop controllers' verify matmuls round apart from the decode
-    # ones, so looped rows are held to the same cycles over realigned caches.
+    # token, loop controllers included.
     if mx.default_device() != mx.gpu:
         pytest.skip("q8 attention kernels")
     monkeypatch.setattr(loopcd, "FIRST_CONTROL_TOKEN", _FIRST_CONTROL)
@@ -258,15 +253,12 @@ def test_rows_keep_their_own_accepted_drafts(dims, head_dim, monkeypatch):
     tokens = mx.stack(tokens, axis=1).tolist()
 
     got = _verify_cycles(model, ids, lengths, tokens)
-    if "loop_config" in dims:
-        expected = _verify_cycles(model, ids, lengths, tokens, realign=True)
-    else:
-        done, expected = [0, 0, 0], []
-        for want in _ACCEPTS + [(0, 0, 0)]:
-            expected.append(
-                [reference[r, done[r] : done[r] + want[r] + 1] for r in range(3)]
-            )
-            done = [d + a + 1 for d, a in zip(done, want)]
+    done, expected = [0, 0, 0], []
+    for want in _ACCEPTS + [(0, 0, 0)]:
+        expected.append(
+            [reference[r, done[r] : done[r] + want[r] + 1] for r in range(3)]
+        )
+        done = [d + a + 1 for d, a in zip(done, want)]
     for cycle, (rows, refs) in enumerate(zip(got, expected)):
         for r, (a, b) in enumerate(zip(rows, refs)):
             assert mx.array_equal(a, b).item(), (cycle, r)
