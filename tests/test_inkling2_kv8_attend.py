@@ -177,3 +177,50 @@ def test_dense_verify_shared_tiles_match_reference(b, length, pad, window, monke
     monkeypatch.setattr(kn, "_Q8_SHARED_TILES", True)
     routed = kn.banded_sink_attention(q, k, v, rel, sink, scale=128**-0.5, window=window, left_padding=lp)
     assert _rel_err(routed, ref) < 1e-2
+
+
+@pytest.mark.parametrize("b,length,pad", [(1, 2, None), (1, 8, None), (2, 8, [0, 300]), (3, 5, [5, 0, 900])])
+def test_q8_verify_rows_equal_their_decode_steps(b, length, pad, monkeypatch):
+    q, k, v, rel, sink = _inputs(b=b, length=length, s=2100)
+    cache = Affine8KVCache(bits=8, seed=3)
+    cache.update_and_fetch(k, v)
+    ks, vs = cache.state
+    qr = cache.key_codec.prepare_queries(q).astype(q.dtype)
+    lp = None if pad is None else mx.array(pad, dtype=mx.int32)
+
+    class _S:
+        def __init__(self, st, n):
+            self.indices, self.norms, self.shape = st.indices, st.norms, (b, 8, n, 0)
+
+    monkeypatch.setattr(kernels, "_Q8_SHARED_TILES", True)
+    block = kernels.gqa_flash_decode_attention_q8(
+        qr, _S(ks, 2100), _S(vs, 2100), rel, sink, scale=128**-0.5, window=0, left_padding=lp
+    )
+    for p in range(length):
+        n = 2100 - length + p + 1
+        step = kernels.gqa_flash_decode_attention_q8(
+            qr[:, :, p : p + 1], _S(ks, n), _S(vs, n), rel[:, p : p + 1], sink[:, p : p + 1],
+            scale=128**-0.5, window=0, left_padding=lp,
+        )
+        assert mx.array_equal(block[:, :, p : p + 1], step).item(), p
+
+
+@pytest.mark.parametrize(
+    "b,length,pad,window",
+    [(1, 8, None, 0), (3, 8, [0, 300, 7], 0), (2, 8, [0, 3], 64), (2, 5, None, 64)],
+)
+def test_dense_verify_rows_equal_their_decode_steps(b, length, pad, window, monkeypatch):
+    s = 400 if window else 2100
+    q, k, v, rel, sink = _inputs(b=b, length=length, s=s, r=64 if window else 16)
+    lp = None if pad is None else mx.array(pad, dtype=mx.int32)
+    monkeypatch.setattr(kernels, "_Q8_SHARED_TILES", True)
+    block = kernels.gqa_flash_decode_attention(
+        q, k, v, rel, sink, scale=128**-0.5, window=window, left_padding=lp
+    )
+    for p in range(length):
+        n = s - length + p + 1
+        step = kernels.gqa_flash_decode_attention(
+            q[:, :, p : p + 1], k[:, :, :n], v[:, :, :n], rel[:, p : p + 1], sink[:, p : p + 1],
+            scale=128**-0.5, window=window, left_padding=lp,
+        )
+        assert mx.array_equal(block[:, :, p : p + 1], step).item(), p

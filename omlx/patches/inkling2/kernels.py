@@ -1097,14 +1097,19 @@ _DECODE_PART_SOURCE = """
     const int g = int(sg) * 8 + fm;
     const bool row_ok = g < G;
     const int h = hk * G + (row_ok ? g : 0);
-    // Index of the query's own key, and the number of keys it sees.
+    // Slots count back from utop. Full-attention rows put it a multiple of
+    // CHUNK above the newest real key, so tiles sit on absolute key positions
+    // and a verify row is tiled exactly as the decode step of its token.
+    // Windowed rows count from their own key: their cache drops old keys.
     const int a = S - L + pos;
-    int nk = a + 1 - lp;
-    if (WINDOW > 0) {
-        nk = min(nk, WINDOW);
-    }
+    const int ua = a - lp;
+    const int utop = WINDOW > 0 ? ua + 1 : ((max(S - 1 - lp, 0)) / CHUNK + 1) * CHUNK;
+    const int shift = utop - 1 - ua;
+    const int e_lo = utop - (S - lp);
+    const int ulo = WINDOW > 0 ? max(0, ua - WINDOW + 1) : 0;
+    const int row_end = utop - ulo;
     const int d_begin = chunk * CHUNK;
-    const int d_end = min(d_begin + CHUNK, nk);
+    const int d_end = ua < 0 ? d_begin : min(d_begin + CHUNK, row_end);
     const float qscale = scale[0] * LOG2E;
 
     // As in the prefill kernel: tiles staged in half (exact for FP16 and for
@@ -1151,8 +1156,8 @@ _DECODE_PART_SOURCE = """
                 const int col = (c % (D / 8)) * 8;
                 uint4 kw = uint4(0);
                 uint4 vw = uint4(0);
-                if (d0 + r < d_end) {
-                    const int key = a - d0 - r;
+                if (d0 + r < d_end && d0 + r >= e_lo) {
+                    const int key = lp + utop - 1 - d0 - r;
                     kw = *(const device uint4*)(kb_ptr + key * k_strides[2] + col);
                     vw = *(const device uint4*)(vb_ptr + key * v_strides[2] + col);
                 }
@@ -1184,8 +1189,8 @@ _DECODE_PART_SOURCE = """
                 const int col = c % D;
                 float kv = 0.0f;
                 float vv = 0.0f;
-                if (d0 + r < d_end) {
-                    const int key = a - d0 - r;
+                if (d0 + r < d_end && d0 + r >= e_lo) {
+                    const int key = lp + utop - 1 - d0 - r;
                     kv = float(kb_ptr[key * k_strides[2] + col * k_strides[3]]);
                     vv = float(vb_ptr[key * v_strides[2] + col * v_strides[3]]);
                 }
@@ -1210,20 +1215,22 @@ _DECODE_PART_SOURCE = """
             }
         }
 
-        // Every tile holds a visible key (d0 < d_end), so rmax is a score.
+        // A tile may hold no key this row sees; rmax then stays -FLT_MAX and
+        // the tile leaves m, l and O unchanged.
         float sc[BK / 4];
         float rmax = -FLT_MAX;
         #pragma clang loop unroll(full)
         for (int kb = 0; kb < BK / 8; ++kb) {
             #pragma clang loop unroll(full)
             for (int e = 0; e < 2; ++e) {
-                const int d = d0 + kb * 8 + fn + e;
+                const int dd = d0 + kb * 8 + fn + e;
+                const int d = dd - shift;
                 float s = Sf[kb].thread_elements()[e] * qscale;
-                if (d < R) {
+                if (d >= 0 && d < R) {
                     s += float(relp[d]) * LOG2E;
                 }
                 sc[kb * 2 + e] = s;
-                if (d < d_end) {
+                if (dd < row_end && d >= 0 && (WINDOW == 0 || d < WINDOW)) {
                     rmax = max(rmax, s);
                 }
             }
@@ -1239,8 +1246,9 @@ _DECODE_PART_SOURCE = """
         for (int kb = 0; kb < BK / 8; ++kb) {
             #pragma clang loop unroll(full)
             for (int e = 0; e < 2; ++e) {
-                const int d = d0 + kb * 8 + fn + e;
-                const float p = d < d_end
+                const int dd = d0 + kb * 8 + fn + e;
+                const int d = dd - shift;
+                const float p = (dd < row_end && d >= 0 && (WINDOW == 0 || d < WINDOW))
                     ? precise::exp2(sc[kb * 2 + e] - m_new) : 0.0f;
                 Pf[kb].thread_elements()[e] = half(p);
                 rsum += p;
@@ -1340,6 +1348,11 @@ _DECODE_SLIDING_CHUNK = 128
 _DECODE_STAGERS = 2
 
 
+def _decode_chunks(s: int, window: int, chunk: int) -> int:
+    """Chunks of the part kernel grid over the keys a row sees."""
+    return max(1, -(-(min(s, window) if window else s) // chunk))
+
+
 def _use_flash_decode(q, k) -> bool:
     """BF16/FP16 queries on the GPU whose head layout fits the decode kernel."""
     return (
@@ -1379,7 +1392,9 @@ def gqa_flash_decode_attention(q, k, v, rel, sink, *, scale, window, left_paddin
         )
     part, fold = _decode_kernels
     # Verify blocks share each staged tile across their positions.
-    shared = length > 1 and _Q8_SHARED_TILES and length * g <= 8 * _Q8_MAX_ROW_GROUPS
+    shared = (
+        length > 1 and not window and _Q8_SHARED_TILES and length * g <= 8 * _Q8_MAX_ROW_GROUPS
+    )
     if shared:
         global _decode_rows_part
         if _decode_rows_part is None:
@@ -1391,9 +1406,8 @@ def gqa_flash_decode_attention(q, k, v, rel, sink, *, scale, window, left_paddin
                 ensure_row_contiguous=False,
             )
         part = _decode_rows_part
-    reach = min(s, window + (length - 1 if shared else 0)) if window else s
     chunk = _DECODE_SLIDING_CHUNK if window else _DECODE_CHUNK
-    ns = max(1, -(-reach // chunk))
+    ns = _decode_chunks(s, window, chunk)
     nsg = max(-(-(length * g if shared else g) // 8), _DECODE_STAGERS)
     dims = mx.array([length, s, ns] + [0] * b, dtype=mx.int32)
     if left_padding is not None:
@@ -1456,7 +1470,7 @@ def _q8_part_source() -> str:
     const bool vec_q8 = k_strides[3] == 1 && v_strides[3] == 1
         && (k_strides[2] & 3) == 0 && (v_strides[2] & 3) == 0
         && (uintptr_t(kb_ptr) & 15) == 0 && (uintptr_t(vb_ptr) & 15) == 0;
-    #define KEY_OF(d0_, r_) (a - (d0_) - (r_))
+    #define KEY_OF(d0_, r_) (lp + utop - 1 - (d0_) - (r_))
 
     // Slot r of a tile is the key at distance d0 + r.
     for (int d0 = d_begin; d0 < d_end; d0 += BK) {
@@ -1470,7 +1484,7 @@ def _q8_part_source() -> str:
                 uint4 vw = uint4(0u);
                 float ksc = 0.0f;
                 float vsc = 0.0f;
-                if (d0 + r < d_end) {
+                if (d0 + r < d_end && d0 + r >= e_lo) {
                     const int key = KEY_OF(d0, r);
                     kw = *(const device uint4*)(kb_ptr + key * k_strides[2] + w4 * 4);
                     vw = *(const device uint4*)(vb_ptr + key * v_strides[2] + w4 * 4);
@@ -1495,8 +1509,8 @@ def _q8_part_source() -> str:
             uint vw = 0u;
             float ksc = 0.0f;
             float vsc = 0.0f;
-            if (d0 + r < d_end) {
-                const int key = a - d0 - r;
+            if (d0 + r < d_end && d0 + r >= e_lo) {
+                const int key = KEY_OF(d0, r);
                 kw = kb_ptr[key * k_strides[2] + w * k_strides[3]];
                 vw = vb_ptr[key * v_strides[2] + w * v_strides[3]];
                 ksc = float(ksb[key * ks_strides[2]]);
@@ -1519,22 +1533,13 @@ _decode_q8_part = None
 
 # Verify blocks (L > 1 queries) over the 8-bit cache: one threadgroup per KV
 # head serves every query position, so each K/V tile is staged once instead of
-# once per position. Tiles are indexed by distance from the block's newest key;
-# a row (position, head) at position p is L - 1 - p keys behind it, so its own
-# distance, causal end, bias band and window are shifted per row.
+# once per position.
 def _q8_rows_part_source() -> str:
     return _rows_part_source(_q8_part_source())
 
 
 def _rows_part_source(src: str) -> str:
     """The shared-tile verify variant of a decode part kernel source."""
-    src = src.replace(
-        "                    const int key = a - d0 - r;\n",
-        "                    const int key = (S - 1) - d0 - r;\n",
-    ).replace(
-        "    #define KEY_OF(d0_, r_) (a - (d0_) - (r_))\n",
-        "    #define KEY_OF(d0_, r_) ((S - 1) - (d0_) - (r_))\n",
-    )
     edits = [
         (
             "    const int pos = gy % L;\n    const int hk = gy / L;\n",
@@ -1550,71 +1555,17 @@ def _rows_part_source(src: str) -> str:
             "    const bool row_ok = rr < L * G;\n"
             "    const int pos = row_ok ? rr / G : 0;\n"
             "    const int g = row_ok ? rr % G : 0;\n"
-            "    const int h = hk * G + g;\n"
-            "    const int shift = L - 1 - pos;\n",
+            "    const int h = hk * G + g;\n",
         ),
-        (
-            "    const int a = S - L + pos;\n"
-            "    int nk = a + 1 - lp;\n"
-            "    if (WINDOW > 0) {\n"
-            "        nk = min(nk, WINDOW);\n"
-            "    }\n",
-            "    // Keys any row of the block sees, counted back from the newest one.\n"
-            "    int nk = S - lp;\n"
-            "    if (WINDOW > 0) {\n"
-            "        nk = min(nk, WINDOW + L - 1);\n"
-            "    }\n",
-        ),
-
         (
             "        if (int(sg) * 8 >= G) {\n",
             "        if (int(sg) * 8 >= L * G) {\n",
         ),
-        (
-            "        // Every tile holds a visible key (d0 < d_end), so rmax is a score.\n",
-            "        // A row may see no key of a tile (the newest keys of earlier\n"
-            "        // positions); its rmax then stays -FLT_MAX and its p are zero.\n",
-        ),
-        (
-            "                const int d = d0 + kb * 8 + fn + e;\n"
-            "                float s = Sf[kb].thread_elements()[e] * qscale;\n"
-            "                if (d < R) {\n"
-            "                    s += float(relp[d]) * LOG2E;\n"
-            "                }\n"
-            "                sc[kb * 2 + e] = s;\n"
-            "                if (d < d_end) {\n",
-            "                const int dd = d0 + kb * 8 + fn + e;\n"
-            "                const int d = dd - shift;\n"
-            "                float s = Sf[kb].thread_elements()[e] * qscale;\n"
-            "                if (d >= 0 && d < R) {\n"
-            "                    s += float(relp[d]) * LOG2E;\n"
-            "                }\n"
-            "                sc[kb * 2 + e] = s;\n"
-            "                if (dd < d_end && d >= 0 && (WINDOW == 0 || d < WINDOW)) {\n",
-        ),
-        (
-            "                const int d = d0 + kb * 8 + fn + e;\n"
-            "                const float p = d < d_end\n",
-            "                const int dd = d0 + kb * 8 + fn + e;\n"
-            "                const int d = dd - shift;\n"
-            "                const float p = (dd < d_end && d >= 0 && (WINDOW == 0 || d < WINDOW))\n",
-        ),
-        (
-            "        const float m_new = first ? rmax : max(m, rmax);\n"
-            "        const float factor = first ? 0.0f : precise::exp2(m - m_new);\n",
-            "        const float m_new = first ? rmax : max(m, rmax);\n"
-            "        // exp2 of -FLT_MAX - -FLT_MAX is 1 and l is still 0 then.\n"
-            "        const float factor = first ? 0.0f : precise::exp2(m - m_new);\n",
-        ),
     ]
-    # Keys are staged by distance from the block's newest key in every load path.
-    src = src.replace("const int key = a - d0 - r;", "const int key = (S - 1) - d0 - r;")
     for old, new in edits:
         if src.count(old) != 1:
             raise RuntimeError(f"verify kernel: anchor not found once: {old[:60]!r}")
         src = src.replace(old, new)
-    if " a - d0 - r" in src or "(a - (d0_)" in src:
-        raise RuntimeError("verify kernel: a per-position key index is left")
     return src
 
 
@@ -1681,7 +1632,9 @@ def gqa_flash_decode_attention_q8(
         )
     fold = _decode_kernels[1]
     # Verify blocks share each staged tile across their positions.
-    shared = length > 1 and _Q8_SHARED_TILES and length * g <= 8 * _Q8_MAX_ROW_GROUPS
+    shared = (
+        length > 1 and not window and _Q8_SHARED_TILES and length * g <= 8 * _Q8_MAX_ROW_GROUPS
+    )
     if shared and _decode_q8_rows_part is None:
         _decode_q8_rows_part = mx.fast.metal_kernel(
             name="omlx_inkling2_flash_verify_part_q8",
@@ -1690,9 +1643,8 @@ def gqa_flash_decode_attention_q8(
             source=_q8_rows_part_source(),
             ensure_row_contiguous=False,
         )
-    reach = min(s, window + (length - 1 if shared else 0)) if window else s
     chunk = _DECODE_SLIDING_CHUNK if window else _DECODE_CHUNK
-    ns = max(1, -(-reach // chunk))
+    ns = _decode_chunks(s, window, chunk)
     rows = length * g if shared else g
     nsg = max(-(-rows // 8), _DECODE_STAGERS)
     dims = mx.array([length, s, ns] + [0] * b, dtype=mx.int32)
