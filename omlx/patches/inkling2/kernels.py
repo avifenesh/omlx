@@ -1418,9 +1418,21 @@ def _use_flash_decode(q, k) -> bool:
     )
 
 
-def gqa_flash_decode_attention(q, k, v, rel, sink, *, scale, window, left_padding=None):
+def decode_reads_row_ends(length: int, dtype) -> bool:
+    """Whether ``banded_sink_attention`` takes ``row_ends`` for these query blocks."""
+    return (
+        length < _FLASH_MIN_QUERIES
+        and dtype in (mx.bfloat16, mx.float16)
+        and mx.default_device() == mx.gpu
+    )
+
+
+def gqa_flash_decode_attention(
+    q, k, v, rel, sink, *, scale, window, left_padding=None, row_ends=None
+):
     """``banded_sink_attention`` for batched or left-padded decode-sized
-    BF16/FP16 query blocks. Each row has the bits of the same row run alone."""
+    BF16/FP16 query blocks. Each row has the bits of the same row run alone;
+    ``row_ends`` lists each row's own end in ``k`` when rows stop short."""
     global _decode_kernels
     b, hq, length, d = q.shape
     hkv, s = k.shape[1], k.shape[2]
@@ -1431,7 +1443,7 @@ def gqa_flash_decode_attention(q, k, v, rel, sink, *, scale, window, left_paddin
                 name="omlx_inkling2_flash_decode_part",
                 input_names=["q", "k", "v", "rel", "dims", "scale"],
                 output_names=["part_o", "part_m", "part_l"],
-                source=_DECODE_PART_SOURCE,
+                source=_row_end_source(_DECODE_PART_SOURCE),
                 ensure_row_contiguous=False,
             ),
             mx.fast.metal_kernel(
@@ -1455,7 +1467,7 @@ def gqa_flash_decode_attention(q, k, v, rel, sink, *, scale, window, left_paddin
                 name="omlx_inkling2_flash_verify_window_part",
                 input_names=["q", "k", "v", "rel", "dims", "scale"],
                 output_names=["part_o", "part_m", "part_l"],
-                source=_window_rows_part_source(_DECODE_PART_SOURCE),
+                source=_row_end_source(_window_rows_part_source(_DECODE_PART_SOURCE)),
                 ensure_row_contiguous=False,
             )
         part = _decode_window_rows_part
@@ -1466,7 +1478,7 @@ def gqa_flash_decode_attention(q, k, v, rel, sink, *, scale, window, left_paddin
                 name="omlx_inkling2_flash_verify_part",
                 input_names=["q", "k", "v", "rel", "dims", "scale"],
                 output_names=["part_o", "part_m", "part_l"],
-                source=_rows_part_source(_DECODE_PART_SOURCE),
+                source=_row_end_source(_rows_part_source(_DECODE_PART_SOURCE)),
                 ensure_row_contiguous=False,
             )
         part = _decode_rows_part
@@ -1476,9 +1488,10 @@ def gqa_flash_decode_attention(q, k, v, rel, sink, *, scale, window, left_paddin
         nsg = max(length, _DECODE_STAGERS)
     else:
         nsg = max(-(-(length * g if shared else g) // 8), _DECODE_STAGERS)
-    dims = mx.array([length, s, ns] + [0] * b, dtype=mx.int32)
+    ends = [s] * b if row_ends is None else [int(e) for e in row_ends]
+    dims = mx.array([length, s, ns] + [0] * b + ends, dtype=mx.int32)
     if left_padding is not None:
-        dims = mx.concatenate([dims[:3], left_padding.astype(mx.int32)])
+        dims = mx.concatenate([dims[:3], left_padding.astype(mx.int32), dims[3 + b :]])
     part_o, part_m, part_l = part(
         inputs=[
             q,
@@ -2151,15 +2164,22 @@ def banded_sink_attention(
     scale: float,
     window: int = 0,
     left_padding=None,
+    row_ends=None,
 ) -> mx.array:
     """Attention with a relative bias band and per-query sink logits.
 
     q: [B, Hq, L, D]; k, v: [B, Hkv, S, D] (queries are the last L keys);
     rel: [B, L, Hq, R] bias by backward distance d (applied for d < R);
     sink: [B, L, Hq] logits of a zero-value sink. ``window`` > 0 limits
-    keys to d < window (sliding layers use window == R).
+    keys to d < window (sliding layers use window == R). ``row_ends`` lists
+    each row's own end in ``k`` when rows stop short of the last key.
     """
     b, length = q.shape[0], q.shape[2]
+    if row_ends is not None:
+        return gqa_flash_decode_attention(
+            q, k, v, rel, sink, scale=scale, window=window,
+            left_padding=left_padding, row_ends=row_ends,
+        )
     if (
         (b > 1 or left_padding is not None or (1 < length <= 8 and _Q8_SHARED_TILES and not is_row_exact_armed()))
         and length < _FLASH_MIN_QUERIES

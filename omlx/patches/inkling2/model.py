@@ -858,7 +858,7 @@ class Inkling2Attention(nn.Module):
         )
 
     def attend(self, q, k, v, rel, sink, kv, state=None):
-        left_padding = None
+        left_padding = row_ends = None
         value_codec = None
         if kv is not None:
             k, v = kv.update_and_fetch(k, v)
@@ -884,7 +884,7 @@ class Inkling2Attention(nn.Module):
                 v = kv.value_codec.dequantize_rotated(v, dtype)
                 value_codec = kv.value_codec
         elif state is not None:
-            k, v, left_padding = windows.append(state, k, v)
+            k, v, left_padding, row_ends = windows.append(state, k, v)
         out = self._long_attention(q, k, v, rel, sink, left_padding)
         if out is None:
             out = kernels.banded_sink_attention(
@@ -896,6 +896,7 @@ class Inkling2Attention(nn.Module):
                 scale=self.scale,
                 window=self.window,
                 left_padding=left_padding,
+                row_ends=row_ends,
             )
         if value_codec is not None:
             out = value_codec._rotate_inverse(out).astype(q.dtype)

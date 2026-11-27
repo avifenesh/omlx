@@ -13,6 +13,7 @@ import pytest
 from mlx_lm.models.cache import KVCache
 
 from omlx.affine4 import Affine8KVCache
+from omlx.patches.inkling2 import cache as windows
 from omlx.patches.inkling2 import loopcd
 from omlx.patches.mlx_lm_mtp.fused_batch import (
     _clamp_to_shared_accept,
@@ -262,3 +263,25 @@ def test_rows_keep_their_own_accepted_drafts(dims, head_dim, monkeypatch):
     for cycle, (rows, refs) in enumerate(zip(got, expected)):
         for r, (a, b) in enumerate(zip(rows, refs)):
             assert mx.array_equal(a, b).item(), (cycle, r)
+
+
+def test_rows_short_of_the_window_end_read_as_moved_rows():
+    # A row that kept fewer drafts ends short of the newest window column until
+    # a re-cut; reading the state slots first moves it, with the same bits.
+    if mx.default_device() != mx.gpu:
+        pytest.skip("decode kernels read each row's end")
+    model = _bf16(_inkling2_tiny(sliding_window_size=16, rel_extent=16, **_TINY_PLAIN))
+    lengths = (40, 33, 47)
+    ids = mx.random.randint(0, _FIRST_CONTROL, (3, 60))
+    block = mx.stack([ids[r, n : n + 8] for r, n in enumerate(lengths)])
+    nxt = mx.stack([ids[r, n + 9 : n + 10] for r, n in enumerate(lengths)])
+    logits = []
+    for read in (False, True):
+        cache = _prefilled(model, ids, lengths)
+        mx.eval(model(block, cache=cache))
+        with _ragged_trim_rows(cache, [5, 1, 3], 7):
+            model.rollback_speculative_cache(cache, None, [5, 1, 3], 8)
+        if read:
+            mx.eval([e.cache for e in cache if isinstance(e, windows.ArraysCache)])
+        logits.append(model(nxt, cache=cache))
+    assert mx.array_equal(logits[0], logits[1]).item()
