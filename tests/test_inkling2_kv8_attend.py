@@ -13,8 +13,11 @@ import mlx.core as mx
 import pytest
 
 from omlx.affine4 import Affine8KVCache
+from omlx.custom_kernels.nax import is_nax_available
 from omlx.patches.inkling2 import kernels
 from omlx.patches.inkling2.model import Inkling2Attention
+from omlx.patches.qwen35_verify_qmm import row_exact_armed
+from omlx.utils import nax_attention
 
 
 def _inputs(b=1, hq=24, hkv=8, length=1, s=300, d=128, r=16, seed=0):
@@ -224,3 +227,60 @@ def test_dense_verify_rows_equal_their_decode_steps(b, length, pad, window, monk
             scale=128**-0.5, window=window, left_padding=lp,
         )
         assert mx.array_equal(block[:, :, p : p + 1], step).item(), p
+
+
+@pytest.mark.skipif(not is_nax_available(), reason="needs tensor units (NAX)")
+@pytest.mark.parametrize("b,pad", [(1, None), (2, [0, 300])])
+def test_prefill_int8_qk_stays_close_to_the_dequantized_route(b, pad):
+    q, k, v, rel, sink = _inputs(b=b, length=64, s=2100)
+    cache = Affine8KVCache(bits=8, seed=3)
+    cache.update_and_fetch(k, v)
+    ks, vs = cache.state
+    rotated = cache.key_codec.prepare_queries(q)
+    qr = rotated.astype(q.dtype)
+    kd = cache.key_codec.dequantize_rotated(ks, mx.bfloat16)
+    vd = cache.value_codec.dequantize_rotated(vs, mx.bfloat16)
+    lp = None if pad is None else mx.array(pad, dtype=mx.int32)
+    int8_keys = (rotated, ks.indices.view(mx.int8), ks.norms)
+    got = kernels.banded_sink_attention(
+        qr, kd, vd, rel, sink, scale=128**-0.5, left_padding=lp, int8_keys=int8_keys
+    )
+    current = kernels.banded_sink_attention(qr, kd, vd, rel, sink, scale=128**-0.5, left_padding=lp)
+    ref = kernels._masked_attention(
+        rotated, kd.astype(mx.float32), vd.astype(mx.float32), rel.astype(mx.float32),
+        sink.astype(mx.float32), 128**-0.5, 0, lp,
+    )
+    assert not mx.array_equal(got, current).item()
+    assert _rel_err(got, current) < 1e-2
+    assert _rel_err(got, ref) < 1e-2
+
+
+@pytest.mark.parametrize("length,q8_decode", [(1, True), (8, True), (1, False), (8, False)])
+def test_decode_and_verify_blocks_keep_their_kernels(length, q8_decode, monkeypatch):
+    import omlx.patches.inkling2.model as m
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("int8 Q.K^T route taken")
+
+    monkeypatch.setattr(nax_attention, "nax_banded_int8_key_attention", refuse)
+    monkeypatch.setattr(m, "_Q8_DECODE", q8_decode)
+    q, k, v, rel, sink = _inputs(length=length, s=1500)
+    mx.eval(Inkling2Attention.attend(_attn(), q, k, v, rel, sink, Affine8KVCache(bits=8, seed=3)))
+
+
+def test_row_exact_verify_rows_keep_their_kernel(monkeypatch):
+    def refuse(*args, **kwargs):
+        raise AssertionError("int8 Q.K^T route taken")
+
+    monkeypatch.setattr(nax_attention, "nax_banded_int8_key_attention", refuse)
+    q, k, v, rel, sink = _inputs(length=40, s=1500)
+    cache = Affine8KVCache(bits=8, seed=3)
+    with row_exact_armed():
+        out = Inkling2Attention.attend(_attn(), q, k, v, rel, sink, cache)
+        ks, vs = cache.state
+        qr = cache.key_codec.prepare_queries(q).astype(q.dtype)
+        ref = kernels.banded_sink_attention(
+            qr, cache.key_codec.dequantize_rotated(ks, q.dtype),
+            cache.value_codec.dequantize_rotated(vs, q.dtype), rel, sink, scale=128**-0.5,
+        )
+    assert mx.array_equal(out, cache.value_codec._rotate_inverse(ref).astype(q.dtype)).item()

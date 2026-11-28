@@ -56,7 +56,7 @@ from __future__ import annotations
 
 import logging
 import struct
-from functools import lru_cache
+from functools import cache, lru_cache
 from typing import Optional
 
 import mlx.core as mx
@@ -175,6 +175,7 @@ struct ExpSubOp {
 //   of two fp32 partial dot products (a summation-order change).
 template <
     typename T,
+    typename QKT,
     int BQ,
     int BK,
     int BD,
@@ -195,10 +196,13 @@ template <
     typename StridePtr,
     typename MaskPtr,
     typename SinkPtr,
-    typename StatePtr>
+    typename StatePtr,
+    typename ScalePtr>
 METAL_FUNC void attention_nax_bdv(
-    const device T* Q,
-    const device T* K,
+    const device QKT* Q,
+    const device QKT* K,
+    ScalePtr QS,
+    ScalePtr KS,
     const device T* V,
     device T* O,
     const device AttnParams* params,
@@ -358,8 +362,24 @@ METAL_FUNC void attention_nax_bdv(
   K += int64_t(kb_start) * BK * K_strides[2];
   V += int64_t(kb_start) * BK * V_strides[2];
 
+  // INT8 queries and keys: int32 scores, times query row scale x key scale.
+  constexpr bool QK8 = metal::is_same_v<QKT, int8_t>;
+  AccumType q_scale[kRowsPT];
+  if constexpr (QK8) {
+    QS += (int64_t(tid.z) * params->H + tid.y) * params->qL;
+    KS += (int64_t(tid.z) * (params->H / params->gqa_factor) + kv_head_idx) *
+        (int64_t(params->NK) * BK);
+    OMLX_NAX_UNROLL
+    for (short i = 0; i < kRowsPT; ++i) {
+      const int row = min(
+          int(tid.x) * BQ + tm + sm + i * otile_t::kFragRowsJump,
+          params->qL - 1);
+      q_scale[i] = QS[row] * float(scale2);
+    }
+  }
+
   // Query fragments, loaded once and kept in registers.
-  NAXTile<T, TQ, TD> Qreg;
+  NAXTile<QKT, TQ, TD> Qreg;
   if (!align_Q && is_last_q) {
     Qreg.load_rows(Q, int(Q_strides[2]), lim_rows_q);
   } else {
@@ -375,14 +395,18 @@ METAL_FUNC void attention_nax_bdv(
     stile_t Stile;
 
     Stile.clear();
+    NAXTile<metal::conditional_t<QK8, int, AccumType>, TQ, TK> Itile;
+    if constexpr (QK8) {
+      Itile.clear();
+    }
 
     OMLX_NAX_UNROLL
     for (short iq = 0; iq < TQ; iq++) {
       OMLX_NAX_UNROLL
       for (short ik = 0; ik < TK; ik += 2) {
         auto qk_step = [&](short id) {
-          NAXTile<T, 1, 1> Qtile;
-          NAXTile<T, 2, 1> Ktile;
+          NAXTile<QKT, 1, 1> Qtile;
+          NAXTile<QKT, 2, 1> Ktile;
 
           const int K_load_off = ik * kU * int(K_strides[2]) + id * kU;
 
@@ -395,14 +419,21 @@ METAL_FUNC void attention_nax_bdv(
             Ktile.load(K + K_load_off, int(K_strides[2]));
           }
 
-          stile_t::NAXFrag_t::mma(
-              Stile.frag_at(iq, ik),
-              Stile.frag_at(iq, ik + 1),
-              Qtile.frag_at(0, 0),
-              metal::false_type{},
-              Ktile.frag_at(0, 0),
-              Ktile.frag_at(1, 0),
-              metal::true_type{});
+          auto mma = [&](thread auto& acc) {
+            stile_t::NAXFrag_t::mma(
+                acc.frag_at(iq, ik),
+                acc.frag_at(iq, ik + 1),
+                Qtile.frag_at(0, 0),
+                metal::false_type{},
+                Ktile.frag_at(0, 0),
+                Ktile.frag_at(1, 0),
+                metal::true_type{});
+          };
+          if constexpr (QK8) {
+            mma(Itile);
+          } else {
+            mma(Stile);
+          }
         };
         if constexpr (WN == 2) {
           // The head-dim split kernel keeps static fragment indices.
@@ -417,6 +448,13 @@ METAL_FUNC void attention_nax_bdv(
           }
         }
 
+        if constexpr (QK8) {
+          OMLX_NAX_UNROLL
+          for (short i = 0; i < stile_t::kElemsPerFrag; i++) {
+            Stile.frag_at(iq, ik)[i] = AccumType(Itile.frag_at(iq, ik)[i]);
+            Stile.frag_at(iq, ik + 1)[i] = AccumType(Itile.frag_at(iq, ik + 1)[i]);
+          }
+        }
         if constexpr (WN == 2) {
           // Add the peer's partial scores (its half of the head dims).
           constexpr short kEPF = stile_t::NAXFrag_t::kElemsPerFrag;
@@ -444,9 +482,25 @@ METAL_FUNC void attention_nax_bdv(
     }
 
     // Scale S
-    OMLX_NAX_UNROLL
-    for (short ii = 0; ii < stile_t::kElemsPerTile; ii++) {
-      Stile.elems()[ii] *= float(scale2);
+    if constexpr (QK8) {
+      OMLX_NAX_UNROLL
+      for (short ik = 0; ik < TK; ik++) {
+        const float4 k_scale =
+            *reinterpret_cast<const device float4*>(&KS[kb * BK + ik * kU + sn]);
+        thread auto& fg = Stile.frag_at(0, ik);
+        OMLX_NAX_UNROLL
+        for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
+          OMLX_NAX_UNROLL
+          for (short jj = 0; jj < stile_t::kFragThrCols; jj++) {
+            fg[ii * stile_t::kFragThrCols + jj] *= q_scale[ii] * k_scale[jj];
+          }
+        }
+      }
+    } else {
+      OMLX_NAX_UNROLL
+      for (short ii = 0; ii < stile_t::kElemsPerTile; ii++) {
+        Stile.elems()[ii] *= float(scale2);
+      }
     }
 
     // Mask out length sequence
@@ -766,10 +820,10 @@ METAL_FUNC void attention_nax_bdv(
 _SOURCE = r"""
   threadgroup float xchg[{WN} == 2 ? {WM} * 2 * 16 * 32 : 1];
   omlx_nax::attention_nax_bdv<
-      {T}, {BQ}, {BK}, {BD}, {BDV}, {WM}, {WN},
+      {T}, {QKT}, {BQ}, {BK}, {BD}, {BDV}, {WM}, {WN},
       {ALIGN_Q}, {ALIGN_K}, {HAS_MASK}, {DO_CAUSAL}, {HAS_SINKS},
       {HAS_BAND}, {ROW_SINKS}, {FIRST}, {LAST}, bool, float>(
-      q, k, v, out,
+      q, k, qs, ks, v, out,
       reinterpret_cast<const device omlx_nax::AttnParams*>(params),
       q_strides, k_strides, v_strides, mask_strides,
       mask, sinks, state, state_out, xchg,
@@ -798,10 +852,12 @@ def _kernel(
     wn: int = 1,
     has_band: bool = False,
     row_sinks: bool = False,
+    qk8: bool = False,
 ):
     wm = _WM // wn
     source = (
         _SOURCE.replace("{T}", _METAL_TYPES[dtype])
+        .replace("{QKT}", "int8_t" if qk8 else _METAL_TYPES[dtype])
         .replace("{BQ}", str(16 * wm))
         .replace("{BK}", str(_BK))
         .replace("{BD}", str(bd))
@@ -830,11 +886,12 @@ def _kernel(
             last,
             has_band,
             row_sinks,
+            qk8,
         )
     )
     return mx.fast.metal_kernel(
-        name=f"omlx_nax_attention_v3_bd{bd}_bdv{bdv}_wn{wn}_{tag}",
-        input_names=["q", "k", "v", "mask", "sinks", "state", "params"],
+        name=f"omlx_nax_attention_v4_bd{bd}_bdv{bdv}_wn{wn}_{tag}",
+        input_names=["q", "k", "qs", "ks", "v", "mask", "sinks", "state", "params"],
         output_names=["out", "state_out"],
         header=_HEADER,
         source=source,
@@ -881,15 +938,29 @@ def _run(
 
 
 def _run_edges(
-    q, k, v, scale, mask, sinks, edges, wn, rel=None, left_padding=None, window=0
+    q,
+    k,
+    v,
+    scale,
+    mask,
+    sinks,
+    edges,
+    wn,
+    rel=None,
+    left_padding=None,
+    window=0,
+    qk_scales=None,
 ) -> mx.array:
     """Dispatch the key blocks between consecutive ``edges`` in turn.
 
     With ``rel`` ([B, qL, H, R]) the kernel adds the relative bias band,
     ``sinks`` holds one logit per query row ([B, qL, H]) and the first
-    ``left_padding[b]`` keys of row b are masked.
+    ``left_padding[b]`` keys of row b are masked. With ``qk_scales``
+    (query scales [B, H, qL], key scales [B, Hk, kL]) ``q`` and ``k`` are
+    int8 codes and the scores are int8 x int8 products times both scales.
     """
     B, H, qL, D = q.shape
+    dtype = v.dtype
     kL = k.shape[2]
     DV = v.shape[3]
     do_causal = isinstance(mask, str)
@@ -904,15 +975,21 @@ def _run_edges(
     has_band = rel is not None
     # Unused inputs get a one-element placeholder (never read).
     if has_band:
-        mask = mx.contiguous(rel.astype(q.dtype))
+        mask = mx.contiguous(rel.astype(dtype))
     elif has_mask:
         mask = mx.broadcast_to(mask, (B, H, qL, kL))
     else:
         mask = mx.zeros((1,), dtype=mx.bool_)
     if has_sinks:
-        sinks = mx.contiguous(sinks.astype(q.dtype))
+        sinks = mx.contiguous(sinks.astype(dtype))
     else:
-        sinks = mx.zeros((1,), dtype=q.dtype)
+        sinks = mx.zeros((1,), dtype=dtype)
+    if qk_scales is None:
+        qs = ks = mx.zeros((1,), dtype=mx.float32)
+    else:
+        qs = mx.contiguous(qk_scales[0].astype(mx.float32))
+        ks = qk_scales[1].astype(mx.float32)
+        ks = mx.pad(ks, [(0, 0), (0, 0), (0, NK * _BK - kL)])
     # fp32 row state between passes: O accumulator, running max, running sum.
     # Passes in flight each hold their state until their command buffer ends:
     # about 3 GB per call from 128k keys at 8192 queries x 64 heads.
@@ -951,7 +1028,7 @@ def _run_edges(
             )
             params = mx.concatenate([params, pad.view(mx.uint8)])
         kernel = _kernel(
-            q.dtype,
+            dtype,
             D,
             DV,
             # The banded kernel is always built for ragged tails: four
@@ -966,16 +1043,17 @@ def _run_edges(
             wn,
             has_band,
             has_band,
+            qk_scales is not None,
         )
         out, state = kernel(
-            inputs=[q, k, v, mask, sinks, state, params],
+            inputs=[q, k, qs, ks, v, mask, sinks, state, params],
             grid=(NQ * _THREADS, H, B),
             threadgroup=(_THREADS, 1, 1),
             output_shapes=[
                 (B, qL, H, DV) if last else (1,),
                 (1,) if last else (state_size,),
             ],
-            output_dtypes=[q.dtype, mx.float32],
+            output_dtypes=[dtype, mx.float32],
         )
         if has_band and not last and (i + 1) % _BANDED_EVAL_PASSES == 0:
             mx.eval(state)
@@ -1088,14 +1166,23 @@ def _banded_reference(q, k, v, rel, sink, scale, left_padding=None):
 
 
 def _run_banded(
-    q, k, v, rel, sink, scale, pass_keys=None, left_padding=None, window=0
+    q,
+    k,
+    v,
+    rel,
+    sink,
+    scale,
+    pass_keys=None,
+    left_padding=None,
+    window=0,
+    qk_scales=None,
 ) -> mx.array:
     B, H, qL, _ = q.shape
     NK = (k.shape[2] + _BK - 1) // _BK
     edges = _pass_edges(
         B * H, NK, _BANDED_PASS_KEYS if pass_keys is None else pass_keys, 0
     )
-    sinks = mx.contiguous(sink.astype(q.dtype))
+    sinks = mx.contiguous(sink.astype(v.dtype))
     return _run_edges(
         q,
         k,
@@ -1108,6 +1195,7 @@ def _run_banded(
         rel=rel,
         left_padding=left_padding,
         window=window,
+        qk_scales=qk_scales,
     )
 
 
@@ -1185,6 +1273,81 @@ def nax_banded_sink_attention(
         scale,
         left_padding=left_padding,
         window=window,
+    )
+
+
+def _int8_rows(x: mx.array) -> tuple[mx.array, mx.array]:
+    x = x.astype(mx.float32)
+    s = mx.maximum(mx.max(mx.abs(x), axis=-1) / 127.0, 1e-30)
+    return mx.clip(mx.round(x / s[..., None]), -127, 127).astype(mx.int8), s
+
+
+@cache
+def _banded_int8_keys_check_passed(dtype: mx.Dtype) -> bool:
+    try:
+        key = mx.random.key(128129)
+        kq, kk, kv, kr, ks = mx.random.split(key, 5)
+        q = (0.5 * mx.random.normal((2, 4, 100, 128), key=kq)).astype(dtype)
+        k = (0.5 * mx.random.normal((2, 2, 300, 128), key=kk)).astype(dtype)
+        v = (0.5 * mx.random.normal((2, 2, 300, 128), key=kv)).astype(dtype)
+        rel = mx.random.normal((2, 100, 4, 48), key=kr).astype(dtype)
+        sink = mx.random.normal((2, 100, 4), key=ks).astype(dtype)
+        lp = mx.array([0, 37], dtype=mx.int32)
+        scale = 128**-0.5
+        qc, qs = _int8_rows(q)
+        kc, kscale = _int8_rows(k)
+        out = _run_banded(
+            qc, kc, v, rel, sink, scale, 96, lp, qk_scales=(qs, kscale)
+        )
+        ref = _banded_reference(q, k, v, rel, sink, scale, lp)
+        err = mx.abs(out.astype(mx.float32) - ref).max().item()
+    except RuntimeError as exc:
+        logger.warning("NAX int8-key attention disabled: self-check failed (%s)", exc)
+        return False
+    if err >= 2e-2:
+        logger.warning("NAX int8-key attention disabled: self-check error %.3g", err)
+        return False
+    logger.info("NAX banded attention with int8 Q.K^T (%s) enabled", dtype)
+    return True
+
+
+def nax_banded_int8_key_attention(
+    queries: mx.array,
+    key_codes: mx.array,
+    key_scales: mx.array,
+    values: mx.array,
+    rel: mx.array,
+    sink: mx.array,
+    *,
+    scale: float,
+    left_padding: mx.array | None = None,
+) -> mx.array | None:
+    """Full-attention ``nax_banded_sink_attention`` with Q.K^T as int8 x int8
+    on the tensor units, or None when unsupported.
+
+    ``queries`` [B, H, L, 128] (any float dtype) are quantized per row;
+    ``key_codes`` [B, Hk, S, 128] int8 with ``key_scales`` [B, Hk, S] stand
+    for keys ``key_codes * key_scales``; ``values`` [B, Hk, S, 128] bf16/fp16.
+    """
+    if (
+        queries.shape[-1] != 128
+        or values.shape[-1] != 128
+        or values.dtype not in _METAL_TYPES
+        or queries.shape[2] <= 8
+        or not banded_check_passed(values.dtype)
+        or not _banded_int8_keys_check_passed(values.dtype)
+    ):
+        return None
+    codes, query_scales = _int8_rows(queries)
+    return _run_banded(
+        codes,
+        key_codes,
+        values,
+        rel,
+        sink,
+        scale,
+        left_padding=left_padding,
+        qk_scales=(query_scales, key_scales),
     )
 
 

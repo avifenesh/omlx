@@ -2165,6 +2165,7 @@ def banded_sink_attention(
     window: int = 0,
     left_padding=None,
     row_ends=None,
+    int8_keys=None,
 ) -> mx.array:
     """Attention with a relative bias band and per-query sink logits.
 
@@ -2173,6 +2174,8 @@ def banded_sink_attention(
     sink: [B, L, Hq] logits of a zero-value sink. ``window`` > 0 limits
     keys to d < window (sliding layers use window == R). ``row_ends`` lists
     each row's own end in ``k`` when rows stop short of the last key.
+    ``int8_keys`` (fp32 queries, int8 key codes, key scales), when ``k`` is
+    their dequantization, lets full-attention prefill blocks run Q.K^T in int8.
     """
     b, length = q.shape[0], q.shape[2]
     if row_ends is not None:
@@ -2222,6 +2225,12 @@ def banded_sink_attention(
             for r in range(length)
         ]
         return mx.concatenate(rows, axis=1).transpose(0, 2, 1, 3)
+    if int8_keys is not None:
+        out = nax_attention.nax_banded_int8_key_attention(
+            *int8_keys, v, rel, sink, scale=scale, left_padding=left_padding
+        )
+        if out is not None:
+            return out
     out = nax_attention.nax_banded_sink_attention(
         q, k, v, rel, sink, scale=scale, left_padding=left_padding, window=window
     )

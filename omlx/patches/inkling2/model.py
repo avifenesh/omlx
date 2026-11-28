@@ -896,7 +896,7 @@ class Inkling2Attention(nn.Module):
 
     def attend(self, q, k, v, rel, sink, kv, state=None):
         left_padding = row_ends = None
-        value_codec = None
+        value_codec = int8_keys = None
         if kv is not None:
             k, v = kv.update_and_fetch(k, v)
             left_padding = getattr(kv, "left_padding", None)
@@ -908,7 +908,8 @@ class Inkling2Attention(nn.Module):
                 # the value rotation back. The bias band and sinks do not depend
                 # on key or value contents.
                 dtype = q.dtype
-                q = kv.key_codec.prepare_queries(q).astype(dtype)
+                rotated = kv.key_codec.prepare_queries(q)
+                q = rotated.astype(dtype)
                 if _Q8_DECODE and kernels.q8_decode_supported(q, k, kv):
                     # Decode and verify blocks read the codes in place.
                     out = kernels.gqa_flash_decode_attention_q8(
@@ -917,6 +918,7 @@ class Inkling2Attention(nn.Module):
                         row_ends=getattr(kv, "_row_ends", None),
                     )
                     return kv.value_codec._rotate_inverse(out).astype(dtype)
+                int8_keys = (rotated, k.indices.view(mx.int8), k.norms)
                 k = kv.key_codec.dequantize_rotated(k, dtype)
                 v = kv.value_codec.dequantize_rotated(v, dtype)
                 value_codec = kv.value_codec
@@ -934,6 +936,7 @@ class Inkling2Attention(nn.Module):
                 window=self.window,
                 left_padding=left_padding,
                 row_ends=row_ends,
+                int8_keys=int8_keys,
             )
         if value_codec is not None:
             out = value_codec._rotate_inverse(out).astype(q.dtype)
