@@ -1391,6 +1391,69 @@ _DECODE_FOLD_SOURCE = """
         }
     }
 """
+# The decode part kernel with the fold in its last chunk threadgroup: each
+# threadgroup stores its partials as the part kernel does, counts itself done
+# for its (row, KV head, position), and the last one runs the fold's loop over
+# them. One launch per decode step, with the bits of part + fold.
+_DECODE_FUSED_EPILOGUE = """
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    threadgroup_barrier(mem_flags::mem_device);
+    threadgroup bool last_group;
+    if (tid == 0) {
+        device atomic_uint* done = (device atomic_uint*)counter
+            + ((size_t)b * (HQ / G) + hk) * L + pos;
+        last_group = atomic_fetch_add_explicit(done, 1u, memory_order_relaxed) == uint(NS - 1);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!last_group) {
+        return;
+    }
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    constexpr int PER = (D + 31) / 32;
+    for (int gf = int(sg); gf < G; gf += NSG) {
+        const int hf = hk * G + gf;
+        const int frow = ((int)b * HQ + hf) * L + pos;
+        float fm_ = float(sink[b * sink_strides[0] + pos * sink_strides[1]
+                               + hf * sink_strides[2]]) * LOG2E;
+        float fl = 1.0f;
+        float fo[PER];
+        for (int i = 0; i < PER; ++i) {
+            fo[i] = 0.0f;
+        }
+        const size_t base = (size_t)frow * NS;
+        for (int c = 0; c < NS; ++c) {
+            const float lc = part_l[base + c];
+            if (!(lc > 0.0f)) {
+                continue;
+            }
+            const float mc = part_m[base + c];
+            const float m_new = max(fm_, mc);
+            const float f0 = precise::exp2(fm_ - m_new);
+            const float f1 = precise::exp2(mc - m_new);
+            const float l0 = fl * f0;
+            const float l1 = lc * f1;
+            fl = l0 + l1;
+            fm_ = m_new;
+            const device float* po = part_o + (base + c) * D;
+            for (int i = 0; i < PER; ++i) {
+                const int e = int(lane) + 32 * i;
+                if (e < D) {
+                    const float o0 = fo[i] * f0;
+                    const float o1 = po[e] * f1;
+                    fo[i] = o0 + o1;
+                }
+            }
+        }
+        const float inv = 1.0f / fl;
+        for (int i = 0; i < PER; ++i) {
+            const int e = int(lane) + 32 * i;
+            if (e < D) {
+                out[(size_t)frow * D + e] = T(fo[i] * inv);
+            }
+        }
+    }
+"""
+_decode_fused_part = None
 _decode_kernels = None
 # Distances per chunk for full and sliding layers. They stay fixed per layer
 # because a row's bits depend on its chunk layout.
@@ -1492,33 +1555,45 @@ def gqa_flash_decode_attention(
     dims = mx.array([length, s, ns] + [0] * b + ends, dtype=mx.int32)
     if left_padding is not None:
         dims = mx.concatenate([dims[:3], left_padding.astype(mx.int32), dims[3 + b :]])
+    inputs = [q, k, v, mx.contiguous(rel), dims, mx.array([scale], dtype=mx.float32)]
+    template = [
+        ("T", q.dtype),
+        ("IS_BF16", q.dtype == mx.bfloat16),
+        ("D", d),
+        ("HQ", hq),
+        ("G", g),
+        ("R", rel.shape[-1]),
+        ("WINDOW", int(window)),
+        ("CHUNK", chunk),
+        ("NSG", nsg),
+    ]
+    grid = (ns * nsg * 32, hkv * (1 if shared else length), b)
+    part_shapes = [(b, hq, length, ns, d), (b, hq, length, ns), (b, hq, length, ns)]
+    if not shared:
+        global _decode_fused_part
+        if _decode_fused_part is None:
+            _decode_fused_part = mx.fast.metal_kernel(
+                name="omlx_inkling2_flash_decode_fused",
+                input_names=["q", "k", "v", "rel", "dims", "scale", "sink"],
+                output_names=["part_o", "part_m", "part_l", "counter", "out"],
+                source=_row_end_source(_DECODE_PART_SOURCE) + _DECODE_FUSED_EPILOGUE,
+                ensure_row_contiguous=False,
+            )
+        return _decode_fused_part(
+            inputs=inputs + [sink],
+            template=template,
+            grid=grid,
+            threadgroup=(nsg * 32, 1, 1),
+            output_shapes=part_shapes + [(b * hkv * length,), (b, hq, length, d)],
+            output_dtypes=[mx.float32] * 3 + [mx.uint32, q.dtype],
+            init_value=0,
+        )[4]
     part_o, part_m, part_l = part(
-        inputs=[
-            q,
-            k,
-            v,
-            mx.contiguous(rel),
-            dims,
-            mx.array([scale], dtype=mx.float32),
-        ],
-        template=[
-            ("T", q.dtype),
-            ("IS_BF16", q.dtype == mx.bfloat16),
-            ("D", d),
-            ("HQ", hq),
-            ("G", g),
-            ("R", rel.shape[-1]),
-            ("WINDOW", int(window)),
-            ("CHUNK", chunk),
-            ("NSG", nsg),
-        ],
-        grid=(ns * nsg * 32, hkv * (1 if shared else length), b),
+        inputs=inputs,
+        template=template,
+        grid=grid,
         threadgroup=(nsg * 32, 1, 1),
-        output_shapes=[
-            (b, hq, length, ns, d),
-            (b, hq, length, ns),
-            (b, hq, length, ns),
-        ],
+        output_shapes=part_shapes,
         output_dtypes=[mx.float32, mx.float32, mx.float32],
     )
     return fold(
