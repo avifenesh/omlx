@@ -33,7 +33,7 @@ from .moe_verify_gather import _GROUP_SIZES, _HEADER, qmv_fast_layout
 
 logger = logging.getLogger(__name__)
 
-MAX_ROWS = 16
+MAX_ROWS = 64
 # Affine widths this kernel transcribes (oQ2 through oQ8 layers).
 _BITS = (2, 3, 4, 5, 6, 8)
 # Output columns per simdgroup (qmv's own tile: a threadgroup owns 8).

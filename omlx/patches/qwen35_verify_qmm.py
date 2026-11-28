@@ -74,6 +74,7 @@ layers, so the GPU starts while the host still builds the verify.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 from functools import wraps
@@ -123,6 +124,26 @@ def set_verify_qmm_armed(flag: bool, *, row_exact: bool = False) -> None:
 
 def _is_armed() -> bool:
     return getattr(_ROUTE_ARMED, "value", False)
+
+
+def verify_qmm_armed() -> bool:
+    """True inside an armed verify forward, row-exact or not."""
+    return _is_armed() or is_row_exact_armed()
+
+
+@contextlib.contextmanager
+def row_exact_armed(flag: bool = True):
+    """Arm the row-exact mode inside the block (when ``flag``), then restore
+    the routing state the caller had."""
+    if not flag:
+        yield
+        return
+    value, exact = _is_armed(), is_row_exact_armed()
+    set_verify_qmm_armed(True, row_exact=True)
+    try:
+        yield
+    finally:
+        set_verify_qmm_armed(value or exact, row_exact=exact)
 
 
 def is_row_exact_armed() -> bool:

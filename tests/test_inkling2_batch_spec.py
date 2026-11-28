@@ -13,6 +13,7 @@ import pytest
 from mlx_lm.models.cache import KVCache
 
 from omlx.affine4 import Affine8KVCache
+from omlx.custom_kernels.nax import is_nax_available
 from omlx.patches.inkling2 import cache as windows
 from omlx.patches.inkling2 import loopcd
 from omlx.patches.mlx_lm_mtp.fused_batch import (
@@ -21,7 +22,10 @@ from omlx.patches.mlx_lm_mtp.fused_batch import (
     _rows_trim_alone,
     _uniform_accept,
 )
-from omlx.patches.qwen35_verify_qmm import set_verify_qmm_armed
+from omlx.patches.qwen35_verify_qmm import (
+    apply_verify_qmm_patch,
+    set_verify_qmm_armed,
+)
 from tests.test_inkling_vlm_mtp import (
     _FIRST_CONTROL,
     _OPEN_THINKING,
@@ -285,3 +289,90 @@ def test_rows_short_of_the_window_end_read_as_moved_rows():
             mx.eval([e.cache for e in cache if isinstance(e, windows.ArraysCache)])
         logits.append(model(nxt, cache=cache))
     assert mx.array_equal(logits[0], logits[1]).item()
+
+
+@pytest.mark.parametrize("dims", [_TINY_PLAIN, _TINY_LOOP], ids=["plain", "looped"])
+def test_rows_have_one_set_of_bits_at_every_batch_size_and_block_length(dims):
+    # A row's logits do not depend on how many rows share its forward: a B=3
+    # verify block equals the B=3 decode steps, each B=3 decode row equals the
+    # row decoded alone, and a lone verify block equals its decode steps.
+    if not is_nax_available():
+        pytest.skip("tensor-unit projections")
+    apply_verify_qmm_patch()
+    model = _bf16(
+        _inkling2_tiny(
+            sliding_window_size=16,
+            rel_extent=16,
+            hidden_size=1024,
+            head_dim=128,
+            swa_head_dim=128,
+            **dims,
+        )
+    )
+    nn.quantize(
+        model,
+        group_size=64,
+        bits=8,
+        class_predicate=lambda _, m: isinstance(m, nn.Linear),
+    )
+    lengths = (40, 33, 47)
+    ids = mx.random.randint(0, _FIRST_CONTROL, (3, 60))
+    block = mx.stack([ids[r, n : n + 8] for r, n in enumerate(lengths)])
+
+    def decode(cache, tokens):
+        return mx.concatenate(
+            [model(tokens[:, t : t + 1], cache=cache) for t in range(8)], axis=1
+        )
+
+    def verify(cache, tokens, row_exact):
+        set_verify_qmm_armed(True, row_exact=row_exact)
+        try:
+            return model(tokens, cache=cache)
+        finally:
+            set_verify_qmm_armed(False)
+
+    batch_decode = decode(_prefilled(model, ids, lengths), block)
+    assert mx.array_equal(
+        verify(_prefilled(model, ids, lengths), block, False), batch_decode
+    ).item()
+    for r, n in enumerate(lengths):
+        alone = _kv8_cache(model)
+        model(ids[r : r + 1, :n], cache=alone)
+        steps = decode(alone, block[r : r + 1])
+        assert mx.array_equal(steps[0], batch_decode[r]).item(), r
+    alone = _kv8_cache(model)
+    model(ids[:1, : lengths[0]], cache=alone)
+    assert mx.array_equal(verify(alone, block[:1], True)[0], batch_decode[0]).item()
+
+
+def test_decode_projection_rows_have_the_same_bits_at_every_row_count():
+    # The tensor-unit projection of decode and verify rows, a partial last
+    # 32-column tile included: row r of an M-row call equals the one-row call.
+    if not is_nax_available():
+        pytest.skip("tensor-unit projections")
+    from omlx.patches.inkling2.model import _rows_linear
+
+    proj = nn.QuantizedLinear(1024, 1048, bias=False, group_size=64, bits=8)
+    codes = mx.random.randint(0, 2**32 - 1, proj.weight.shape)
+    scales = mx.random.uniform(shape=proj.scales.shape) * 1e-2
+    biases = mx.random.normal(proj.biases.shape) * 1e-2
+    proj.update(
+        {
+            "weight": codes.astype(mx.uint32),
+            "scales": scales.astype(mx.bfloat16),
+            "biases": biases.astype(mx.bfloat16),
+        }
+    )
+    x = mx.random.normal((60, 1024)).astype(mx.bfloat16)
+    set_verify_qmm_armed(True, row_exact=True)
+    try:
+        alone = mx.concatenate([_rows_linear(proj, x[r : r + 1]) for r in range(60)])
+        for rows in (3, 24, 60):
+            got = _rows_linear(proj, x[:rows])
+            assert mx.array_equal(got, alone[:rows]).item(), rows
+    finally:
+        set_verify_qmm_armed(False)
+    stock = mx.quantized_matmul(
+        x, proj.weight, proj.scales, proj.biases, group_size=64, bits=8
+    )
+    assert mx.abs(alone - stock).max().item() <= 2e-2 * mx.abs(stock).max().item()

@@ -2181,12 +2181,18 @@ def banded_sink_attention(
             left_padding=left_padding, row_ends=row_ends,
         )
     if (
-        (b > 1 or left_padding is not None or (1 < length <= 8 and _Q8_SHARED_TILES and not is_row_exact_armed()))
+        (
+            window
+            or b > 1
+            or left_padding is not None
+            or (1 < length <= 8 and _Q8_SHARED_TILES and not is_row_exact_armed())
+        )
         and length < _FLASH_MIN_QUERIES
         and _use_flash_decode(q, k)
     ):
-        # Batches, and a row left alone in a batch cache: the kernel reads
-        # left_padding itself instead of masking every cached key.
+        # Batches, a row left alone in a batch cache, and every windowed row:
+        # the kernel reads left_padding itself instead of masking every cached
+        # key, and a windowed row has the same bits alone as in a batch.
         return gqa_flash_decode_attention(
             q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding
         )

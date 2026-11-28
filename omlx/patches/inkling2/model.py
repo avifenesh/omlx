@@ -31,9 +31,11 @@ import numpy as np
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.cache import ArraysCache, KVCache
 
+from ...custom_kernels import nax_skinny_qmm
+from ...custom_kernels.nax import is_nax_available
 from .. import row_exact_gemv
 from ..moe_verify_gather import pair_order
-from ..qwen35_verify_qmm import is_row_exact_armed
+from ..qwen35_verify_qmm import is_row_exact_armed, row_exact_armed, verify_qmm_armed
 from . import cache as windows
 from . import expert_mma, fused, kernels, loopcd, verify_experts
 
@@ -655,10 +657,10 @@ def _dense(weight: mx.array, x: mx.array) -> mx.array:
 
 def _linear(proj: nn.Module, x: mx.array) -> mx.array:
     """``proj(x)`` for the bias-free projections; a plain Linear goes through
-    ``_dense`` (QuantizedLinear has its own row-exact patch)."""
+    ``_dense``, a QuantizedLinear through ``_rows_linear``."""
     if type(proj) is nn.Linear:
         return _dense(proj.weight, x)
-    return proj(x)
+    return _rows_linear(proj, x)
 
 
 def _project_slice(
@@ -666,8 +668,43 @@ def _project_slice(
 ) -> mx.array:
     """Output rows ``[start:end]`` of a bias-free Linear or QuantizedLinear."""
     if type(proj) is nn.QuantizedLinear:
-        return _row_slice(proj, start, end)(x)
+        return _rows_linear(_row_slice(proj, start, end), x)
     return _dense(proj.weight[start:end], x)
+
+
+def _rows_linear(proj: nn.Module, x: mx.array) -> mx.array:
+    """``proj(x)``. Decode and verify rows (row-exact armed) of an affine
+    group-64 QuantizedLinear run the tensor-unit skinny kernel, whose K split
+    depends on the shape only, so a row has the same bits at every batch size
+    and block length."""
+    k = x.shape[-1]
+    if not (
+        type(proj) is nn.QuantizedLinear
+        and is_row_exact_armed()
+        and is_nax_available()
+        and proj.mode == "affine"
+        and proj.bits in nax_skinny_qmm.BITS
+        and proj.group_size == 64
+        and proj.get("biases") is not None
+        and x.dtype in (mx.bfloat16, mx.float16)
+        and proj.scales.dtype == x.dtype
+        and k % 64 == 0
+        and proj.weight.shape[0] >= 1024
+    ):
+        return proj(x)
+    lead = x.shape[:-1]
+    flat = x.reshape(-1, k)
+    n = proj.weight.shape[0]
+    step = nax_skinny_qmm.MAX_ROWS
+    parts = [
+        nax_skinny_qmm.skinny_qmm(
+            flat[start : start + step], proj.weight, proj.scales, proj.biases,
+            k, n, bits=proj.bits,
+        )
+        for start in range(0, flat.shape[0], step)
+    ]
+    y = parts[0] if len(parts) == 1 else mx.concatenate(parts)
+    return y.reshape(*lead, -1)
 
 
 def _row_slice(proj: nn.QuantizedLinear, start: int, end: int | None):
@@ -1199,7 +1236,7 @@ class Inkling2Layer(nn.Module):
         if bank is not None:
             _bf16_loop_weights(self)
         compiled = length <= _COMPILED_MAX_TOKENS
-        if compiled and length > 1 and is_row_exact_armed():
+        if compiled and b * length > 1 and is_row_exact_armed():
             pre, post = self._pre_exact, self._post_exact
         elif compiled:
             pre, post = self._pre_compiled, self._post_compiled
@@ -1515,12 +1552,20 @@ class Model(nn.Module):
         if observe:
             capture_layer_ids = list(drafter.target_layer_ids)
         capture = {int(i): None for i in capture_layer_ids or ()}
-        h = self.model(inputs, cache, input_embeddings, capture=capture)
-        if self.model._reference_visits:
-            reference = capture[loopcd.REFERENCE]
-            logits = self._loopcd_logits(h, reference, inputs, cache)
-        else:
-            logits = self.logits_from_hidden(h)
+        length = (inputs if input_embeddings is None else input_embeddings).shape[1]
+        # Every row of a decode step or an (armed) verify block takes arithmetic
+        # that depends on neither the batch size nor the block length.
+        exact = (
+            (length == 1 or (length <= _COMPILED_MAX_TOKENS and verify_qmm_armed()))
+            and self._omlx_mtp_row_exact_verify
+        )
+        with row_exact_armed(exact):
+            h = self.model(inputs, cache, input_embeddings, capture=capture)
+            if self.model._reference_visits:
+                reference = capture[loopcd.REFERENCE]
+                logits = self._loopcd_logits(h, reference, inputs, cache)
+            else:
+                logits = self.logits_from_hidden(h)
         if not capture_layer_ids and not return_hidden:
             return logits
         captures = [capture[int(i)] for i in capture_layer_ids or ()]

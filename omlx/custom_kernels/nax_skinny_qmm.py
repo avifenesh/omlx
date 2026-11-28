@@ -55,7 +55,8 @@ _SOURCE = """
     for (int f = 0; f < 2; ++f) {
         OMLX_NAX_UNROLL
         for (int i = 0; i < 2; ++i) {
-            const int n = n0 + 16 * f + fm + 8 * i;
+            // A partial last tile reads column N - 1 and does not store it.
+            const int n = min(n0 + 16 * f + fm + 8 * i, N - 1);
             if (PACKED) {
                 const ulong tile = ulong(n / TILE_N);
                 const int col = n % TILE_N;
@@ -203,7 +204,9 @@ _SOURCE = """
                     for (int f = 0; f < 2; ++f) {
                         OMLX_NAX_UNROLL
                         for (int c = 0; c < 4; ++c) {
-                            yp[16 * f + c] = static_cast<T>(acc[t][f][4 * i + c]);
+                            if (N % 32 == 0 || n0 + fn + 16 * f + c < N) {
+                                yp[16 * f + c] = static_cast<T>(acc[t][f][4 * i + c]);
+                            }
                         }
                     }
                 }
@@ -273,7 +276,10 @@ def skinny_qmm(
     packed: bool = False,
     tile_n: int = 128,
 ) -> mx.array:
-    """``x2`` (M, K) times affine group-64 weights (N, K) -> (M, N) in x2's dtype."""
+    """``x2`` (M, K) times affine group-64 weights (N, K) -> (M, N) in x2's dtype.
+
+    Any M from 1 to MAX_ROWS and any N work; the routes below take 9..48 rows
+    and whole 32-column tiles."""
     M = int(x2.shape[0])
     s = split(N)
     (y,) = _kernel()(
@@ -288,7 +294,7 @@ def skinny_qmm(
             ("RF", -(-M // 16)),
             ("S", s),
         ],
-        grid=(32 * s * (N // 32), 1, 1),
+        grid=(32 * s * -(-N // 32), 1, 1),
         threadgroup=(32 * s, 1, 1),
         output_shapes=[(M, N)],
         output_dtypes=[x2.dtype],
